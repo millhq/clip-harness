@@ -53,7 +53,9 @@ closed — rejected, never executed as bare text.
 The same tolerance covers the mutation fences: text whose first line
 is an exact `path:` header parses as the file fence's contents when
 the next line is an explicit `op:` line (file.write REQUIRES an op in
-this form), or as the patch fence's contents when the body begins
+this form, and stricter than the fence: create/update/delete only —
+no auto — with a non-empty body for create/update and an empty body
+for delete), or as the patch fence's contents when the body begins
 with a unified-diff header (`---` / `+++`). An invalid `op:` value,
 or a `path:` header followed by neither, fails closed — such text is
 never treated as bare shell text and never staged.
@@ -81,6 +83,10 @@ _HEADER_LINE = re.compile(
 _PATH_LINE = re.compile(r"^path\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _OP_LINE = re.compile(r"^op\s*:\s*(create|update|delete|auto)\s*$", re.IGNORECASE)
 _OP_ATTEMPT = re.compile(r"^op\s*:", re.IGNORECASE)
+# The unfenced file form accepts only the explicit ops — `auto` is
+# fenced-only, where the fence itself marks the text as a payload.
+_OP_LINE_UNFENCED = re.compile(
+    r"^op\s*:\s*(create|update|delete)\s*$", re.IGNORECASE)
 _ATTR_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)=(.*)$")
 _ID_KEYS = {"id", "session"}
 
@@ -248,8 +254,11 @@ def _parse_unfenced_file(text: str) -> Payload | None:
     - line 1 must be an exact `path:` header (the same `_PATH_LINE`
       grammar the fences use);
     - a following `op:` line makes it a FILE payload, and file.write
-      REQUIRES that explicit op in this form — an `op:` line whose
-      value is not create/update/delete/auto is malformed;
+      REQUIRES that explicit op in this form. The op must be
+      create, update or delete — `auto` is fenced-only here, and
+      any other value is malformed. create/update REQUIRE a
+      non-empty body (the file content; there is no explicit
+      empty-file support), and delete REQUIRES an empty body;
     - with no `op:` line, the body must begin with a unified-diff
       header (first line starts `---`, second starts `+++`) to be a
       PATCH payload. The op wins when both are present: a file whose
@@ -266,11 +275,22 @@ def _parse_unfenced_file(text: str) -> Payload | None:
         return None
     rest = lines[1:]
     if rest and _OP_ATTEMPT.match(rest[0]):
-        if not _OP_LINE.match(rest[0]):
+        op_match = _OP_LINE_UNFENCED.match(rest[0])
+        if not op_match:
             raise PayloadError(
                 f"unfenced file payload has an invalid 'op:' line: "
-                f"{rest[0].strip()!r} (expected create, update, "
-                f"delete or auto)")
+                f"{rest[0].strip()!r} (expected create, update or "
+                f"delete — auto is fenced-only)")
+        op = op_match.group(1).lower()
+        body = "\n".join(rest[1:])
+        if op == "delete" and body.strip():
+            raise PayloadError(
+                "unfenced 'op: delete' payload must have an empty "
+                "body")
+        if op in ("create", "update") and not body.strip():
+            raise PayloadError(
+                f"unfenced 'op: {op}' payload needs the file "
+                f"content as its body")
         spec = _parse_file_body("file", text)
         return Payload(command="", kind="run", files=[spec], raw=text)
     if len(rest) >= 2 and rest[0].startswith("---") \

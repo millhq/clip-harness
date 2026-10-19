@@ -340,6 +340,40 @@ def test_unfenced_file_invalid_op_fails_closed():
                              allow_bare=True)
 
 
+def test_unfenced_op_auto_fails_closed():
+    # Stricter than the fence: in the unfenced form the op must be
+    # explicit — `auto` is fenced-only.
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("path: a.txt\nop: auto\nbody\n",
+                             allow_bare=True)
+    # The fenced grammar is unchanged: auto still parses there.
+    payload = parse_payload("```file\npath: a.txt\nop: auto\nbody\n```")
+    assert payload.files[0].declared_op == "auto"
+
+
+def test_unfenced_delete_with_body_fails_closed():
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("path: a.txt\nop: delete\nleftover\n",
+                             allow_bare=True)
+    # Fenced delete tolerates (ignores) a body, as before.
+    payload = parse_payload(
+        "```file\npath: a.txt\nop: delete\nignored\n```")
+    assert payload.files[0].declared_op == "delete"
+    assert payload.files[0].content == ""
+
+
+def test_unfenced_create_update_empty_body_fails_closed():
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("path: a.txt\nop: create\n",
+                             allow_bare=True)
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("path: a.txt\nop: update\n  \n",
+                             allow_bare=True)
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("path: a.txt\nop: create",
+                             allow_bare=True)
+
+
 def test_unfenced_invalid_diff_header_fails_closed():
     # `path:` then a body that is neither op:-headed nor a real
     # unified diff (second line is not `+++`).

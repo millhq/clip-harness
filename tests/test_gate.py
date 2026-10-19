@@ -225,14 +225,26 @@ def test_traversal_target_rejected_at_staging(tmp_path):
     from clip_harness.gate import GateError
     work = tmp_path / "work"
     work.mkdir()
-    for path in ("../escape.txt", "sub/../../escape.txt",
-                 str(tmp_path / "absolute.txt")):
+    for path in ("../escape.txt", "sub/../../escape.txt"):
         with pytest.raises(GateError):
             _stage(tmp_path, [FileSpec(path=path, declared_op="create",
                                        content="x\n")], work)
     # Nothing staged, nothing written outside the workdir.
     assert not (tmp_path / "escape.txt").exists()
-    assert not (tmp_path / "absolute.txt").exists()
+
+
+def test_absolute_target_stages_at_its_named_path(tmp_path):
+    # An absolute path is an explicit target, not a traversal: it
+    # stages (behind the same review gate) at the named location.
+    work = tmp_path / "work"
+    work.mkdir()
+    target = tmp_path / "elsewhere" / "named.txt"
+    candidate = _stage(tmp_path, [FileSpec(
+        path=str(target), declared_op="create", content="x\n")], work)
+    entry = candidate.entries[0]
+    assert entry.abs_path == str(target)
+    assert entry.actual_op == "NEW"
+    assert not target.exists()  # staging still writes nothing live
 
 
 # -- apply -------------------------------------------------------------------

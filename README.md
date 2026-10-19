@@ -175,10 +175,13 @@ runs get the same manifest and sticky footer as fenced runs.
 The mutation fences get the same tolerance, under stricter rules.
 Text whose first line is an exact `path:` header is the ```file or
 ```patch fence's contents when what follows disambiguates it: an
-explicit `op:` line (`create` / `update` / `delete` / `auto`) makes
-it a file payload — file.write **requires** that op in this form —
-and a body beginning with a unified-diff header (`---` then `+++`)
-makes it a patch payload. (The op wins if both are present: a file
+explicit `op:` line makes it a file payload — file.write
+**requires** that op in this form, and the unfenced form is
+stricter than the fence: the op must be `create`, `update` or
+`delete` (`auto` is fenced-only), create/update require the file
+content as a non-empty body, and delete requires an empty body. A
+body beginning with a unified-diff header (`---` then `+++`) makes
+it a patch payload. (The op wins if both are present: a file
 whose content is itself a diff is legitimate.) The payload then
 flows through the identical staging, review and apply path as a
 fenced one — same manifest, same base-hash checks, same

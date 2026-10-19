@@ -394,9 +394,11 @@ def classify_and_stage(candidate_dir: Path, run_id: str,
                        specs: list[FileSpec], cwd: Path) -> Candidate:
     """Stage every file spec as a candidate. Never writes live files.
 
-    A spec whose resolved target escapes the working directory
-    (``../`` traversal, an absolute path elsewhere) is rejected —
-    GateError, fail closed — before anything is staged.
+    A spec whose RELATIVE path resolves outside the working
+    directory (``../`` traversal) is rejected — GateError, fail
+    closed — before anything is staged. An absolute path names its
+    target explicitly and stages like any other target, behind the
+    same review gate.
     """
     candidate_dir.mkdir(parents=True, exist_ok=True)
     (candidate_dir / "candidates").mkdir(exist_ok=True)
@@ -407,7 +409,8 @@ def classify_and_stage(candidate_dir: Path, run_id: str,
 
     for index, spec in enumerate(specs):
         abs_path = (cwd / spec.path).resolve()
-        if not abs_path.is_relative_to(cwd_root):
+        if not Path(spec.path).is_absolute() \
+                and not abs_path.is_relative_to(cwd_root):
             raise GateError(
                 f"file target escapes the working directory: "
                 f"{spec.path!r}")

@@ -1248,6 +1248,41 @@ def case_48(env: Env):
           "unfenced traversal wrote outside the project")
 
 
+def case_49(env: Env):
+    # Acceptance (filed issue): the exact M365 copy-button clipboard,
+    # driven through the zero-argument clipboard entry point — stage,
+    # review, accept, and the file lands byte-exact, reported NEW.
+    target = Path("/tmp/clip-harness-m365-file-smoke.txt")
+    target.unlink(missing_ok=True)
+    env.clip.write_text(
+        "path: /tmp/clip-harness-m365-file-smoke.txt\n"
+        "op: create\n"
+        "clip_harness_file_review=ok", encoding="utf-8")
+    proc = env.trigger()
+    check(proc.returncode == 0, proc.stderr)
+    check("awaiting review" in env.clip_text(),
+          f"unfenced acceptance payload did not park: "
+          f"{env.clip_text()!r}")
+    cid = env.candidate_id()
+    entry = env.manifest(cid)["entries"][0]
+    check(entry["path"] == "/tmp/clip-harness-m365-file-smoke.txt"
+          and entry["actual_op"] == "NEW",
+          f"acceptance candidate staged wrong: {entry}")
+    proc = env.cli("candidate", "review", cid, "--decision", "accept")
+    check(proc.returncode == 0, proc.stderr)
+    check(target.read_text(encoding="utf-8")
+          == "clip_harness_file_review=ok",
+          f"accepted file content wrong: {target.read_bytes()!r}")
+    block = env.clip_text()
+    check("✓ /tmp/clip-harness-m365-file-smoke.txt — NEW" in block,
+          f"result does not report the file as NEW: {block!r}")
+    for text in (block, proc.stdout):
+        check("path:: command not found" not in text
+              and "op:: command not found" not in text,
+              f"header lines reached the shell: {text!r}")
+    target.unlink(missing_ok=True)
+
+
 # =======================================================================
 # Matrix runner
 # =======================================================================

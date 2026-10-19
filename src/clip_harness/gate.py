@@ -59,8 +59,113 @@ _MUTATION_PATTERNS = [
 _MUTATION_RE = re.compile("|".join(_MUTATION_PATTERNS))
 
 
-def looks_like_mutation(command: str) -> bool:
-    return bool(_MUTATION_RE.search(command))
+def _mask_quoted(command: str) -> str:
+    """The command with quoted contents blanked to spaces.
+
+    Length and positions are preserved; the quote characters
+    themselves stay. Shell metacharacters inside quotes are data,
+    not syntax — an awk comparison like 'NR>1' is not a redirect —
+    so the mutation patterns scan this copy and only real shell
+    syntax can match. Backslash escapes are honoured inside double
+    quotes and outside quotes (an escaped quote opens nothing);
+    inside single quotes a backslash is literal, as in sh. An
+    unterminated quote masks to the end of the string.
+    """
+    out = list(command)
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\":
+            i += 2  # escaped char (maybe a quote) is not syntax
+            continue
+        if ch not in ("'", '"'):
+            i += 1
+            continue
+        quote = ch
+        i += 1
+        while i < n:
+            ch = command[i]
+            if quote == '"' and ch == "\\" and i + 1 < n:
+                out[i] = out[i + 1] = " "
+                i += 2
+                continue
+            if ch == quote:
+                break
+            out[i] = " "
+            i += 1
+        i += 1  # the closing quote (or one past the end)
+    return "".join(out)
+
+
+def _quoted_span(text: str, start: int) -> tuple[str, int]:
+    """(contents, end index) of the quoted span opening at `start`.
+
+    Double quotes honour backslash escapes (the escaped char is what
+    the inner shell sees); single quotes are literal. An
+    unterminated span runs to the end of the string.
+    """
+    quote = text[start]
+    chars: list[str] = []
+    i = start + 1
+    while i < len(text):
+        ch = text[i]
+        if quote == '"' and ch == "\\" and i + 1 < len(text):
+            chars.append(text[i + 1])
+            i += 2
+            continue
+        if ch == quote:
+            return "".join(chars), i + 1
+        chars.append(ch)
+        i += 1
+    return "".join(chars), len(text)
+
+
+# A nested shell invocation: bash/sh/zsh/... with a -c flag (possibly
+# bundled, e.g. -lc), then the command string as the next argument.
+_SHELL_C_ARG = re.compile(
+    r"(?:^|[\s;&|])\s*(?:\S*/)?(?:bash|zsh|dash|ksh|sh)"
+    r"(?:\s+-[A-Za-z]+)*\s+-[A-Za-z]*c[A-Za-z]*\s+")
+
+
+def _shell_c_arguments(command: str) -> list[str]:
+    """The command strings handed to nested `sh -c '...'` shells.
+
+    Those quotes belong to the OUTER shell — the argument is a
+    command line in its own right, so the mutation scan must see
+    through it (`bash -c 'rm x'` mutates even though `rm` sits inside
+    quotes from the outer command's point of view).
+    """
+    args: list[str] = []
+    for match in _SHELL_C_ARG.finditer(command):
+        i = match.end()
+        if i >= len(command):
+            break
+        if command[i] in ("'", '"'):
+            arg, _end = _quoted_span(command, i)
+            args.append(arg)
+        else:
+            word = re.match(r"[^\s;&|]+", command[i:])
+            if word:
+                args.append(word.group(0))
+    return args
+
+
+_MAX_C_DEPTH = 4
+
+
+def looks_like_mutation(command: str, _depth: int = 0) -> bool:
+    """Heuristic: does this shell command write to files?
+
+    Scans a quote-masked copy of the command, plus — recursively —
+    the argument of any nested `sh -c` invocation, whose own quoted
+    spans are masked at its own level in turn.
+    """
+    if _MUTATION_RE.search(_mask_quoted(command)):
+        return True
+    if _depth >= _MAX_C_DEPTH:
+        return False
+    return any(looks_like_mutation(arg, _depth + 1)
+               for arg in _shell_c_arguments(command))
 
 
 def _glob_any(command: str, patterns: list[str]) -> str | None:

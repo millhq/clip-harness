@@ -6,7 +6,8 @@ import pytest
 
 from clip_harness.core import Decision, FileSpec
 from clip_harness.gate import (DecisionRecord, apply_candidate,
-                               classify_and_stage, evaluate_policy)
+                               classify_and_stage, evaluate_policy,
+                               looks_like_mutation)
 from clip_harness.settings import Settings
 
 
@@ -63,6 +64,88 @@ def test_protected_path_read_is_not_blocked():
     s = settings(protected_paths=[".env"], allowlist=["cat *"])
     verdict = evaluate_policy("cat .env", s)
     assert verdict.hard_block is False
+
+
+# -- mutation heuristic: quoted text is data, not shell syntax -----------
+#
+# Regression: a read-only inspection command (ps/awk process filter,
+# wc / shasum / `bash -n` over two scripts) was held as "mutates
+# files" because the raw scan read the awk comparison `NR>1` inside
+# quotes as a shell redirect. The scan now runs over a quote-masked
+# copy: quoted contents are blanked, real shell syntax still shows.
+
+READONLY_INSPECTION = (
+    "ps -eo pid,args | awk 'NR>1 && /helm/ {print $1}'\n"
+    "awk '/normalize/ {found=1} "
+    "END {if (!found) print \"helm_normalizer=stopped\"}' procs.txt\n"
+    "printf '%s\\n' '=== IMPLEMENTATION IDENTITIES ==='\n"
+    "for file in suppliers/helm/discover suppliers/helm/normalize; do\n"
+    "  if test -f \"$file\"; then\n"
+    "    printf 'lines=%s\\n' \"$(wc -l < \"$file\" | tr -d ' ')\"\n"
+    "    printf 'sha256=%s\\n' \"$(shasum -a 256 \"$file\" "
+    "| awk '{print $1}')\"\n"
+    "    /bin/bash -n \"$file\" && printf 'bash_syntax=valid\\n' "
+    "|| printf 'bash_syntax=invalid\\n'\n"
+    "  fi\n"
+    "done\n")
+
+
+def test_readonly_inspection_is_not_a_mutation():
+    assert looks_like_mutation(READONLY_INSPECTION) is False
+    verdict = evaluate_policy(READONLY_INSPECTION, settings())
+    assert verdict.decision == Decision.ALLOW
+
+
+@pytest.mark.parametrize("command", [
+    "echo x > out.txt",
+    "cmd >> log",
+    "sed -i 's/a/b/' f",
+    "cp a b",
+    "rm -rf x",
+    "echo hi > '/tmp/spaced name'",
+    # An escaped quote opens no span: the redirect after it is real.
+    "echo don\\'t > out",
+])
+def test_real_mutations_still_flagged(command):
+    assert looks_like_mutation(command) is True
+
+
+@pytest.mark.parametrize("command", [
+    "grep 'a>b' f",
+    "awk '$3 >= 2 {print}'",
+    "printf '%s\\n' 'a > b'",
+    'echo "results > expectations"',
+    # An escaped quote inside double quotes ends no span.
+    'echo "say \\"hi > there\\""',
+    # An unterminated quote masks to the end of the string.
+    "awk 'NR>1 {print}",
+])
+def test_quoted_metacharacters_are_not_mutations(command):
+    assert looks_like_mutation(command) is False
+
+
+def test_mask_quoted_preserves_positions():
+    from clip_harness.gate import _mask_quoted
+    masked = _mask_quoted("a 'b>c' \"d>e\" f")
+    assert masked == "a '   ' \"   \" f"
+    assert len(masked) == len("a 'b>c' \"d>e\" f")
+
+
+# -- mutation heuristic: nested `sh -c` shells are seen through -----------
+
+@pytest.mark.parametrize("command", [
+    "bash -c 'rm x'",
+    'bash -c "mv a b"',
+    "sh -c 'echo hi > out'",
+    "/bin/bash -lc 'touch x'",
+    "bash -c 'bash -c \"rm x\"'",
+])
+def test_nested_shell_mutations_flagged(command):
+    assert looks_like_mutation(command) is True
+
+
+def test_nested_shell_quoted_comparison_not_flagged():
+    assert looks_like_mutation("bash -c 'awk \"NR>1\"'") is False
 
 
 # -- classification + staging ----------------------------------------------

@@ -32,6 +32,7 @@ from .goals import GoalStore
 from .hooks import dispatch
 from .payload import Payload
 from .receipts import Ledger
+from .render import paint, printer
 from .runner import LifecycleRunner
 from .sessions import SessionRegistry
 from .settings import load_settings
@@ -54,7 +55,7 @@ def _default_clipboard():
     return None
 
 
-def _default_decider():
+def _default_decider(settings=None):
     """The inline decision channel. Consulted ONLY for `attend: true`
     payloads (async runs park instead), so the headless file-drop
     decider may poll generously: drop a decision.json into the
@@ -62,7 +63,8 @@ def _default_decider():
     bounded by CLIP_HARNESS_ATTEND_WAIT_S (default 600s)."""
     from .adapters.headless import FileDropDecider, TerminalDecider
     if sys.stdin.isatty():
-        return TerminalDecider()
+        return TerminalDecider(
+            out=printer(settings.color if settings else "auto"))
     wait = float(os.environ.get("CLIP_HARNESS_ATTEND_WAIT_S", "600"))
     return FileDropDecider(timeout_s=wait)
 
@@ -76,9 +78,9 @@ def _default_diff_opener():
 
 def _runner(settings, **overrides) -> LifecycleRunner:
     kwargs = dict(settings=settings, clipboard=_default_clipboard(),
-                  decider=_default_decider(),
+                  decider=_default_decider(settings),
                   diff_opener=_default_diff_opener(),
-                  presenter=print)
+                  presenter=printer(settings.color))
     kwargs.update(overrides)
     return LifecycleRunner(**kwargs)
 
@@ -103,7 +105,7 @@ def cmd_trigger(args) -> int:
     if outcome is None:
         return 0
     if outcome.result_block:
-        print(outcome.result_block)
+        print(paint(outcome.result_block, settings.color))
     else:
         print(f"clip-harness: {outcome.state.value} — {outcome.message}")
     return 0
@@ -149,7 +151,7 @@ def cmd_run(args) -> int:
         print("clip-harness: no payload found", file=sys.stderr)
         return 1
     if outcome.result_block:
-        print(outcome.result_block)
+        print(paint(outcome.result_block, settings.color))
     else:
         print(f"clip-harness: {outcome.state.value} — {outcome.message}")
     return 0
@@ -271,7 +273,7 @@ def cmd_candidate(args) -> int:
         return 1
     candidate = load_candidate(candidate_dir)
     if args.candidate_cmd == "show":
-        print(candidate.presentation())
+        print(paint(candidate.presentation(), settings.color))
         return 0
     if args.candidate_cmd == "decide":
         if not args.decision:
@@ -304,7 +306,7 @@ def cmd_candidate(args) -> int:
             decider = _static_decider(record)
         elif sys.stdin.isatty():
             from .adapters.headless import TerminalDecider
-            decider = TerminalDecider()
+            decider = TerminalDecider(out=printer(settings.color))
             if runner.diff_opener is not None:
                 runner.diff_opener(candidate)
         else:
@@ -314,7 +316,7 @@ def cmd_candidate(args) -> int:
             return 1
         outcome = runner.review_candidate(args.id, decider)
     if outcome.result_block:
-        print(outcome.result_block)
+        print(paint(outcome.result_block, settings.color))
     else:
         print(f"clip-harness: {outcome.state.value} — {outcome.message}")
     return 0
@@ -349,7 +351,7 @@ def cmd_rerun(args) -> int:
     outcome = runner._handle_trigger(
         Payload(kind="rerun", session_id=args.id), os.getcwd())
     if outcome.result_block:
-        print(outcome.result_block)
+        print(paint(outcome.result_block, settings.color))
     else:
         print(f"clip-harness: {outcome.state.value} — {outcome.message}")
     return 0
@@ -384,7 +386,7 @@ def cmd_finish(args) -> int:
         clipboard = _default_clipboard()
         if clipboard is not None:
             clipboard.set_text(block)
-    print(block)
+    print(paint(block, settings.color))
     print(f"# run {run_id} closed: {closed}", file=sys.stderr)
     return 0
 

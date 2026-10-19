@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 from ..core import ExecResult
+from ..render import printer
 from ..runner import LifecycleRunner
 from .headless import FileDropDecider
 from .macos import PbClipboard, VSCodeDiffOpener
@@ -138,7 +139,7 @@ async def main(connection, settings, state_dir: Path, cwd: str) -> None:
         decider=FileDropDecider(timeout_s=0),
         diff_opener=VSCodeDiffOpener(),
         executor=ITerm2TabExecutor(session, loop),
-        presenter=print)
+        presenter=printer(settings.color))
     pasteboard = NSPasteboard.generalPasteboard()
     last_change = pasteboard.changeCount()
     runner.arm(cwd)

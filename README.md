@@ -377,6 +377,7 @@ project. See [examples/settings.example.json](examples/settings.example.json).
   "protected_paths": [".env", "~/.ssh"],
   "hard_block_patterns": ["rm\\s+-rf\\s+/"],
   "mutation_gate": "review",
+  "color": "auto",
   "hooks": {
     "PreRun": [{"matcher": "Bash", "command": "~/hooks/check.py", "timeout": 10}],
     "PostRun": [{"matcher": "*", "command": "~/hooks/notify.py"}]
@@ -386,6 +387,15 @@ project. See [examples/settings.example.json](examples/settings.example.json).
 
 State (receipts, sessions, candidates, goals) lives in
 `~/.local/state/clip-harness` (override with `"state_dir"`).
+
+**Terminal color.** Diffs printed to a terminal — the review
+presentation, `candidate show`, printed result blocks — are colorized
+at print time: additions green, deletions red, file/hunk headers
+cyan. Color lives only in the rendering; the text itself (clipboard,
+result blocks, receipts, files) always stays plain. Control it with
+the `"color"` setting: `"auto"` (default — color only when stdout is
+a TTY), `"always"`, or `"never"`. The `NO_COLOR` environment variable
+forces color off regardless of the setting.
 
 ## CLI surface
 

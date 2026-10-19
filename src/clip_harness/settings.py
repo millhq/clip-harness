@@ -17,6 +17,9 @@ Settings schema (all fields optional):
   "protected_paths": [".env", "*.key", "~/.ssh"],
   "hard_block_patterns": ["rm -rf /", ":(){ :|:& };:"],
   "mutation_gate": "review",         // review | allow | deny
+  "color": "auto",                   // auto | always | never — terminal
+                                     // diff colors (rendering only;
+                                     // NO_COLOR env also forces off)
   "hooks": {
     "PreRun": [
       {"matcher": "Bash", "command": "~/hooks/check.sh", "timeout": 10}
@@ -69,6 +72,9 @@ class Settings:
     protected_paths: list[str] = field(default_factory=list)
     hard_block_patterns: list[str] = field(default_factory=list)
     mutation_gate: str = "review"  # review | allow | deny
+    # Rendering only (terminal diff colors); never part of the gate
+    # config hash — a color change is not a ConfigChange.
+    color: str = "auto"  # auto | always | never
     hooks: dict[str, list[HookHandler]] = field(default_factory=dict)
     # Extra capability-manifest tools declared in settings (hooks may
     # also register tools at runtime via registeredTools).
@@ -122,6 +128,10 @@ def _merge(base: Settings, data: dict, source: str) -> None:
         base.timeout = float(data["timeout"])
     if "mutation_gate" in data:
         base.mutation_gate = str(data["mutation_gate"])
+    color = data.get("color")
+    if isinstance(color, str) and color.lower() in ("auto", "always",
+                                                    "never"):
+        base.color = color.lower()
     for key in ("allowlist", "denylist", "protected_paths", "hard_block_patterns"):
         if key in data and isinstance(data[key], list):
             getattr(base, key).extend(str(x) for x in data[key])

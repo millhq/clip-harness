@@ -154,6 +154,7 @@ def write_defaults(config_dir: Path) -> list[Path]:
     if not settings_path.exists():
         notify = f"python3 {hooks_dir}/notify.py"
         settings = {
+            "color": "auto",
             "hooks": {
                 "PostRun": [{"matcher": "*", "command": notify}],
                 "PostRunFailure": [{"matcher": "*", "command": notify}],

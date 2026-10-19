@@ -15,9 +15,11 @@ which ran live on his Mac:
 Differences from the original: parsing, gating, receipts, sessions and
 the review flow are the core's job now — this module only maps the
 core onto iTerm2. In watch mode the review decider is the
-decision.json file-drop (plus the VS Code diff opener): file payloads
-stage a candidate, Ali reviews in VS Code, and completes the run with
-`clip-harness candidate review <id>` from any terminal.
+decision.json file-drop: file payloads stage a candidate and park;
+Ali reviews in a terminal and completes the run with
+`clip-harness candidate review <id>` — the terminal is the default
+review surface, with VS Code available as an option inside that
+prompt (it never opens on its own).
 
 Requires: iTerm2 with the Python API enabled, the `iterm2` pip module
 (the proven work-Mac deploy path), run as an AutoLaunch script.
@@ -37,7 +39,7 @@ from ..core import ExecResult
 from ..render import printer
 from ..runner import LifecycleRunner
 from .headless import FileDropDecider
-from .macos import PbClipboard, VSCodeDiffOpener
+from .macos import PbClipboard
 
 TAB_TITLE = "agent-loop"
 CLAIM_MARKER = "⏳ running in iTerm2 — "
@@ -137,7 +139,6 @@ async def main(connection, settings, state_dir: Path, cwd: str) -> None:
     runner = LifecycleRunner(
         settings=settings, clipboard=PbClipboard(),
         decider=FileDropDecider(timeout_s=0),
-        diff_opener=VSCodeDiffOpener(),
         executor=ITerm2TabExecutor(session, loop),
         presenter=printer(settings.color))
     pasteboard = NSPasteboard.generalPasteboard()

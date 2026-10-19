@@ -63,7 +63,7 @@ class RunOutcome:
 
 class LifecycleRunner:
     def __init__(self, *, settings: Settings, clipboard=None, decider=None,
-                 diff_opener=None,
+                 diff_opener=None, inline_review: bool = False,
                  presenter: Callable[[str], None] = print,
                  executor: Executor | None = None,
                  session_id: str | None = None,
@@ -72,7 +72,14 @@ class LifecycleRunner:
         self.state_dir = Path(settings.state_dir).expanduser()
         self.clipboard = clipboard
         self.decider = decider
+        # Stored for embedders; the runner itself never opens diffs —
+        # the terminal decider owns the VS Code option (see cli.py).
         self.diff_opener = diff_opener
+        # Entry-point wiring: True when a human fired this run
+        # directly (the trigger / `run` paths in cli.py), so a staged
+        # candidate is decided inline in the same invocation. The
+        # watch entries leave it False — watched runs always park.
+        self.inline_review = inline_review
         self.presenter = presenter
         self.executor = executor or LocalExecutor()
         self.session_id = session_id or f"sess-{time.strftime('%Y%m%d')}"
@@ -368,21 +375,22 @@ class LifecycleRunner:
                            session_id=self.session_id,
                            binding_id=payload.session_id)
         self._dispatch_review(ctx, "staged", run_id, None)
-        # Execution modes: async is the default — the candidate is
-        # staged, the pending notification fires, and the run PARKS in
-        # pending_review; the trigger invocation returns without a
-        # decision. Only an `attend: true` payload waits inline: the
-        # review surface (manifest + inline diffs) is presented and
-        # the decision is taken in the terminal. The same surface is
-        # presented at decision time for parked runs (candidate
-        # review / show) — never by holding the trigger hostage.
+        # Decision points: the candidate is staged and the run PARKS
+        # in pending_review unless a decision is taken inline, right
+        # here. That happens when the payload demands it
+        # (`attend: true`) or when the entry point wired inline
+        # review (the human-fired trigger / `run` paths — see cli.py),
+        # for attended payloads and pure file/patch payloads alike:
+        # the review surface (manifest + inline diffs) is presented
+        # in the terminal and the decision is taken there. The watch
+        # entries never wire inline review, so watched runs always
+        # park. A decider returning None means "decide later" — the
+        # run parks below with its candidate intact.
         record = None
-        if payload.attend:
+        if payload.attend or self.inline_review:
             self.presenter(candidate.presentation()
                            + (f"\n  shell: {payload.command}"
                               if payload.command else ""))
-            if self.diff_opener is not None:
-                self.diff_opener(candidate)
             if self.decider is not None:
                 record = self.decider(candidate)
         if record is None:

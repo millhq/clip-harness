@@ -85,31 +85,42 @@ class StaticDecider:
 
 class TerminalDecider:
     """Interactive terminal review: manifest summary first, then an
-    explicit decision. Used by the local watch / run commands on any
-    platform with a tty; EOF or an empty answer means no decision
-    (the run stays pending — never inferred).
+    explicit decision. The terminal is the default review surface
+    wherever a human is in the loop; when a diff opener is wired in,
+    the prompt loop also offers a VS Code view of the candidate —
+    it opens only when the human picks it, and viewing is not a
+    decision (the prompt repeats). EOF or an empty answer means no
+    decision (the run stays pending — never inferred).
     """
 
-    def __init__(self, input_fn=input, out=print):
+    def __init__(self, input_fn=input, out=print, diff_opener=None):
         self.input_fn = input_fn
         self.out = out
+        self.diff_opener = diff_opener
 
     def __call__(self, candidate: Candidate) -> DecisionRecord | None:
         self.out(candidate.presentation())
-        try:
-            answer = self.input_fn(
-                "[a]ccept / accept-[e]dited / [r]eject / "
-                "Enter = decide later: ").strip().lower()
-        except EOFError:
-            return None
-        if answer in ("a", "accept"):
-            decision = "accept"
-        elif answer in ("e", "edited", "accept-edited"):
-            decision = "accept-edited"
-        elif answer in ("r", "reject"):
-            decision = "reject"
-        else:
-            return None
+        prompt = ("[a]ccept / accept-[e]dited / [r]eject / "
+                  + ("[v]iew in VS Code / "
+                     if self.diff_opener is not None else "")
+                  + "Enter = decide later: ")
+        decision = None
+        while decision is None:
+            try:
+                answer = self.input_fn(prompt).strip().lower()
+            except EOFError:
+                return None
+            if answer in ("a", "accept"):
+                decision = "accept"
+            elif answer in ("e", "edited", "accept-edited"):
+                decision = "accept-edited"
+            elif answer in ("r", "reject"):
+                decision = "reject"
+            elif answer in ("v", "view", "vscode") \
+                    and self.diff_opener is not None:
+                self.diff_opener(candidate)
+            else:
+                return None
         reason = ""
         accepted_files = None
         if decision == "reject":

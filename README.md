@@ -207,25 +207,33 @@ This is a tolerance for a copying artifact, not a second format:
 
 ### Execution modes
 
-The loop is fire-and-forget by design — the human is never blocked
-waiting on it:
+Wherever a human is in the loop, the review is taken in the
+terminal — and plain runs are fire-and-forget: the human is never
+blocked waiting on output.
 
-- **Async (default).** The trigger fires, the run executes, the
-  window is free to hide immediately, and a notification arrives
-  when the run finishes (`PostRun` / `PostRunFailure` hooks). A
-  payload with file changes **parks**: the candidate is staged, the
+- **Trigger / `run` (interactive).** Firing the trigger (or
+  `clip-harness run`) puts you in the loop: a payload with file
+  changes is staged, the review surface (manifest, then inline
+  diffs) is presented in the terminal, and the decision is taken
+  in the same invocation — accept, accept-edited, reject, or
+  *defer*. The prompt also offers a VS Code view of the candidate;
+  it opens only when you pick it, and viewing is not a decision.
+  This holds for attended payloads and pure file/patch payloads
+  alike. Plain commands just run.
+- **Parked (deferred / watch).** Deferring at the trigger prompt —
+  or any payload with file changes under the `watch` loops, which
+  never prompt — **parks** the run: the candidate is staged, the
   `ReviewDecision` *pending* notification fires, and the run waits
-  in `pending_review` — the trigger invocation returns without a
-  decision. The decision arrives later (`candidate review` /
-  `decide` / `apply`, or a `decision.json` drop); only then do
-  apply, receipt, clipboard, and the completion notification
-  happen. For a parked review, rejecting *is* the steering.
-- **Attended (`attend: true`).** The trigger waits inline: the
-  review surface (manifest, then inline diffs) is presented in the
-  terminal, the decision is taken there, and progress is visible —
-  for the runs where the human wants to sit in the loop. Plain
-  commands never park in either mode; `cancel` steers a running
-  command in both.
+  in `pending_review`. The decision arrives later (`candidate
+  review` / `decide` / `apply`, or a `decision.json` drop); only
+  then do apply, receipt, clipboard, and the completion
+  notification happen. For a parked review, rejecting *is* the
+  steering.
+- **Attended (`attend: true`).** The payload itself demands the
+  inline wait in any context that has a decision window — e.g.
+  the iTerm2 watch's `decision.json` drop — for the runs where the
+  human wants to sit in the loop even where the entry point would
+  otherwise park. `cancel` steers a running command in every mode.
 
 ### File fences — the mutation branch
 
@@ -413,10 +421,15 @@ each capped with a pointer to the candidate directory for the full
 diff. That inline diff is the default review surface; VS Code
 (`code --diff` per update, the candidate for creates, the live file
 for deletes) remains available as the deep-review option for the
-same staged candidate. In async mode (the default) none of this
-holds the trigger: the run parks and the surface is presented when
-the human comes to decide (`candidate review` / `candidate show`);
-in attended mode it is presented inline at staging time. The
+same staged candidate — offered inside the terminal prompt and
+opened only when the human picks it; it never opens on its own.
+On the trigger / `run` paths the surface is presented inline at
+staging time and the decision is taken in the same invocation
+(deferring parks the run); under the watch loops the run parks
+and the surface is presented when the human comes to decide
+(`candidate review` / `candidate show`); an `attend: true`
+payload forces the inline wait wherever a decision window exists.
+The
 decision is captured as data (`decision.json`: `accept` /
 `accept-edited` / `reject` + optional reason + optional per-file
 `accepted_files`). Apply runs only on accept, applies only accepted

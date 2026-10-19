@@ -77,9 +77,14 @@ class Env:
 
     # -- CLI driving --------------------------------------------------
     def _env(self, over: dict | None = None) -> dict:
+        # Headless posture: the file-drop decision window is zero
+        # unless a case opts into waiting (case 44) — trigger / run
+        # consult the decider inline, and with no decision dropped
+        # the run must park promptly, not poll for the 600s default.
         env = {"HOME": str(self.home), "PATH": os.environ["PATH"],
                "CLIP_HARNESS_CLIPBOARD_FILE": str(self.clip),
-               "CLIP_HARNESS_STATE": str(self.state)}
+               "CLIP_HARNESS_STATE": str(self.state),
+               "CLIP_HARNESS_ATTEND_WAIT_S": "0"}
         if over:
             env.update(over)
         return env
@@ -1281,6 +1286,41 @@ def case_49(env: Env):
               and "op:: command not found" not in text,
               f"header lines reached the shell: {text!r}")
     target.unlink(missing_ok=True)
+
+
+def case_50(env: Env):
+    # Trigger context: a pure file payload (NO attend header — the
+    # form an M365 copy produces) is decided in the SAME invocation
+    # when the decision lands in the window: no parking, no separate
+    # review call. The headless decision channel is the file drop.
+    env.clip.write_text(
+        "```file\npath: inline.txt\nop: create\ninline-body\n```",
+        encoding="utf-8")
+    proc, out_path = env.bg(
+        env_over={"CLIP_HARNESS_ATTEND_WAIT_S": "60"})
+    cands = env.state / "candidates"
+    env.wait_for(lambda: cands.exists()
+                 and any((d / "manifest.json").exists()
+                         for d in cands.iterdir()),
+                 what="trigger candidate to stage")
+    time.sleep(1.0)
+    check(proc.poll() is None,
+          "trigger returned before the inline decision was given")
+    cid = next(d.name for d in cands.iterdir()
+               if (d / "manifest.json").exists())
+    (cands / cid / "decision.json").write_text(json.dumps(
+        {"decision": "accept", "reason": "", "accepted_files": None}),
+        encoding="utf-8")
+    out = env.bg_finish(proc, out_path, timeout=20)
+    check((env.proj / "inline.txt").read_text() == "inline-body\n",
+          "inline trigger decision was not applied")
+    check("✓ inline.txt — NEW" in out,
+          f"trigger run did not complete inline: {out!r}")
+    check("awaiting review" not in env.clip_text(),
+          f"run parked instead of completing inline: "
+          f"{env.clip_text()!r}")
+    check(env.clip_text().startswith("```result"),
+          f"clipboard holds no result block: {env.clip_text()!r}")
 
 
 # =======================================================================

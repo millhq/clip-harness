@@ -197,10 +197,14 @@ def test_cli_color_always_clipboard_and_receipts_stay_plain(
         encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("CLIP_HARNESS_CLIPBOARD_FILE", str(clip))
+    # The trigger consults the decision channel inline; a zero
+    # window means no decision arrives, so the run parks — the
+    # flow this test exercises (stage -> park -> review -> apply).
+    monkeypatch.setenv("CLIP_HARNESS_ATTEND_WAIT_S", "0")
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.chdir(project)
 
-    # Trigger: the mutation stages and parks (async default).
+    # Trigger: the mutation stages and parks (decide-later).
     assert main([]) == 0
     note = clip.read_text(encoding="utf-8")
     assert ESC not in note

@@ -55,16 +55,21 @@ def _default_clipboard():
     return None
 
 
-def _default_decider(settings=None):
-    """The inline decision channel. Consulted ONLY for `attend: true`
-    payloads (async runs park instead), so the headless file-drop
-    decider may poll generously: drop a decision.json into the
-    candidate directory to decide an attended run. The wait is
-    bounded by CLIP_HARNESS_ATTEND_WAIT_S (default 600s)."""
+def _default_decider(settings=None, diff_opener=None):
+    """The inline decision channel, consulted when a staged candidate
+    is decided in the same invocation (the trigger / `run` paths, or
+    an `attend: true` payload). At a terminal the decider IS the
+    review surface, with VS Code offered inside its prompt — the
+    opener is handed to the decider, never fired by the caller.
+    Headless, the file-drop decider may poll generously: drop a
+    decision.json into the candidate directory to decide the run.
+    The wait is bounded by CLIP_HARNESS_ATTEND_WAIT_S (default
+    600s); no decision inside the window means the run parks."""
     from .adapters.headless import FileDropDecider, TerminalDecider
     if sys.stdin.isatty():
         return TerminalDecider(
-            out=printer(settings.color if settings else "auto"))
+            out=printer(settings.color if settings else "auto"),
+            diff_opener=diff_opener)
     wait = float(os.environ.get("CLIP_HARNESS_ATTEND_WAIT_S", "600"))
     return FileDropDecider(timeout_s=wait)
 
@@ -77,9 +82,10 @@ def _default_diff_opener():
 
 
 def _runner(settings, **overrides) -> LifecycleRunner:
+    opener = _default_diff_opener()
     kwargs = dict(settings=settings, clipboard=_default_clipboard(),
-                  decider=_default_decider(settings),
-                  diff_opener=_default_diff_opener(),
+                  decider=_default_decider(settings, diff_opener=opener),
+                  diff_opener=opener,
                   presenter=printer(settings.color))
     kwargs.update(overrides)
     return LifecycleRunner(**kwargs)
@@ -100,7 +106,9 @@ def cmd_trigger(args) -> int:
     text = clipboard.get_text()
     if not text:
         return 0
-    runner = _runner(settings, clipboard=clipboard)
+    # The human fired the trigger: a staged candidate is reviewed
+    # inline, in this invocation (deferring parks it as usual).
+    runner = _runner(settings, clipboard=clipboard, inline_review=True)
     outcome = runner.process_text(text, os.getcwd(), allow_bare=True)
     if outcome is None:
         return 0
@@ -122,7 +130,10 @@ def cmd_watch(args) -> int:
     if clipboard is None:
         print("clip-harness: no clipboard available", file=sys.stderr)
         return 1
-    runner = _runner(settings, clipboard=clipboard)
+    # The watch is passive: it never prompts inline and never opens
+    # an editor — staged candidates park for a later review.
+    runner = _runner(settings, clipboard=clipboard,
+                     decider=None, diff_opener=None)
     WatchLoop(runner, clipboard, os.getcwd()).run_forever()
     return 0
 
@@ -145,7 +156,7 @@ def cmd_run(args) -> int:
             print("clip-harness: no clipboard available", file=sys.stderr)
             return 1
         text = clipboard.get_text() or ""
-    runner = _runner(settings)
+    runner = _runner(settings, inline_review=True)
     outcome = runner.process_text(text, os.getcwd(), allow_bare=True)
     if outcome is None:
         print("clip-harness: no payload found", file=sys.stderr)
@@ -305,10 +316,11 @@ def cmd_candidate(args) -> int:
                                 if args.files else None))
             decider = _static_decider(record)
         elif sys.stdin.isatty():
+            # Terminal review: VS Code is an option inside the
+            # prompt (owned by the decider), never opened upfront.
             from .adapters.headless import TerminalDecider
-            decider = TerminalDecider(out=printer(settings.color))
-            if runner.diff_opener is not None:
-                runner.diff_opener(candidate)
+            decider = TerminalDecider(out=printer(settings.color),
+                                      diff_opener=runner.diff_opener)
         else:
             print("clip-harness: review needs a decision — pass "
                   "--decision accept|accept-edited|reject (or run in a "

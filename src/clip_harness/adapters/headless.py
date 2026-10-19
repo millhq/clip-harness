@@ -88,9 +88,15 @@ class TerminalDecider:
     explicit decision. The terminal is the default review surface
     wherever a human is in the loop; when a diff opener is wired in,
     the prompt loop also offers a VS Code view of the candidate —
-    it opens only when the human picks it, and viewing is not a
-    decision (the prompt repeats). EOF or an empty answer means no
-    decision (the run stays pending — never inferred).
+    it opens only when the human picks it, and the opener waits for
+    the editor. Viewing alone is not a decision (the prompt
+    repeats), but SAVE is: if the opener reports the staged copies
+    changed in the editor, the review concludes on the spot as
+    accept-edited — the apply then sources those edited staged
+    bytes through the ordinary accept-edited channel, for the whole
+    candidate (per-file picks stay a typed-prompt capability). EOF
+    or an empty answer means no decision (the run stays pending —
+    never inferred).
     """
 
     def __init__(self, input_fn=input, out=print, diff_opener=None):
@@ -101,7 +107,8 @@ class TerminalDecider:
     def __call__(self, candidate: Candidate) -> DecisionRecord | None:
         self.out(candidate.presentation())
         prompt = ("[a]ccept / accept-[e]dited / [r]eject / "
-                  + ("[v]iew in VS Code / "
+                  + ("[v]iew in VS Code "
+                     "(save + close = apply your edits) / "
                      if self.diff_opener is not None else "")
                   + "Enter = decide later: ")
         decision = None
@@ -118,7 +125,15 @@ class TerminalDecider:
                 decision = "reject"
             elif answer in ("v", "view", "vscode") \
                     and self.diff_opener is not None:
-                self.diff_opener(candidate)
+                if self.diff_opener(candidate):
+                    # The human saved edits in VS Code: that IS the
+                    # decision — accept the candidate with them, no
+                    # re-prompt. An opener that reports nothing
+                    # (read-only view, legacy None) loops as before.
+                    return DecisionRecord(
+                        decision="accept-edited", reason="",
+                        accepted_files=None,
+                        decided_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
             else:
                 return None
         reason = ""

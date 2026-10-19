@@ -217,7 +217,8 @@ blocked waiting on output.
   diffs) is presented in the terminal, and the decision is taken
   in the same invocation — accept, accept-edited, reject, or
   *defer*. The prompt also offers a VS Code view of the candidate;
-  it opens only when you pick it, and viewing is not a decision.
+  it opens only when you pick it — and in the editor, saving is
+  the decision (see the review gate below).
   This holds for attended payloads and pure file/patch payloads
   alike. Plain commands just run.
 - **Parked (deferred / watch).** Deferring at the trigger prompt —
@@ -437,6 +438,18 @@ entries, verifies post-apply hashes, and rolls back from the
 pre-apply snapshots on partial failure. On reject: no post hooks
 fire, the receipt records the denial, and the clipboard gets the
 rejection text (rejected diffs included).
+
+Picking the VS Code view waits for the editor: the candidate
+opens in a single `code --wait` session (manifest first, then the
+diffs), and the contract is *save + close = apply your edits* —
+if any staged copy's content differs when VS Code closes, the
+review concludes on the spot as `accept-edited` and applies your
+edited bytes, for the whole candidate (per-file picks remain a
+terminal-prompt capability). Close without saving and nothing
+was decided: you are back at the terminal prompt. A delete's
+live file is view-only in the editor — changing it does not
+count as an edit, and the gate's stale-base check still guards
+the apply.
 
 Built-in policy runs before hooks: hard-block patterns are evaluated
 **before** the allowlist (exit-2 semantics); a denylist match denies;

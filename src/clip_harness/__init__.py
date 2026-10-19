@@ -11,6 +11,6 @@ in one obvious place before publishing.
 from . import _quiet_hashlib  # noqa: F401
 
 NAME = "clip-harness"
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = ["NAME", "__version__"]

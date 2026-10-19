@@ -38,6 +38,18 @@ A copied message is ONE payload made of fences:
 File fences with no shell fence = a pure mutation payload. The canonical
 command fence is ```shell; ```run is accepted as a legacy alias only.
 
+THE UNFENCED FORM (a copy-tolerance, not a second protocol): some chat
+UIs — Microsoft 365 Copilot is the known one — copy a code block's
+CONTENTS without the outer fence when the human uses the block's copy
+button. The model still emits exactly one canonical form (the fence);
+the harness additionally recognises the fence's contents standing
+alone: text that BEGINS with a metadata header (recognised `key:` lines,
+contiguous from line 1) parses as the shell payload that header
+describes, and the header lines never reach the shell. Text that does
+not begin with a recognised metadata line is not an unfenced payload.
+Malformed metadata (a recognised key with an invalid value) fails
+closed — rejected, never executed as bare text.
+
 Control triggers stay single-line, as in the original loop:
     ```cancel```  /  ```cancel id=<session>```
     ```rerun```    /  ```rerun id=<session>```
@@ -73,7 +85,12 @@ def looks_like_trigger(text: str) -> bool:
     stripped = text.strip()
     if any(stripped.startswith("```" + w) for w in ("cancel", "rerun")):
         return True
-    return _FENCE_OPEN_COUNT.search(text) is not None
+    if _FENCE_OPEN_COUNT.search(text) is not None:
+        return True
+    # Unfenced form: a leading recognised metadata line is a payload
+    # attempt (its values are validated at parse time, fail-closed).
+    first_line = text.split("\n", 1)[0]
+    return _HEADER_LINE.match(first_line) is not None
 
 
 def _parse_attrs(text: str) -> dict[str, str]:
@@ -135,6 +152,66 @@ def _parse_shell_body(body: str, fence_attrs: dict[str, str]) -> Payload:
     if header.get("attend"):
         payload.attend = header["attend"].strip().lower() in (
             "true", "yes", "1")
+    return payload
+
+
+# Values the `attend:` header accepts in the unfenced form. The fenced
+# parser maps anything outside ("true", "yes", "1") to False; the
+# unfenced form validates strictly instead, because there is no fence
+# to mark the text as a deliberate payload — a recognised key carrying
+# a nonsense value is malformed metadata, not a bare command.
+_ATTEND_VALUES = ("true", "false", "yes", "no", "1", "0")
+
+
+def _parse_unfenced(text: str) -> Payload | None:
+    """Parse the fence-stripped form of a shell payload.
+
+    Some chat UIs copy a code block's contents without its ``` fence
+    (Microsoft 365 Copilot's copy button is the known case). When the
+    text BEGINS with metadata header lines, it is the shell fence's
+    contents standing alone:
+
+        session: auth-refactor
+        timeout: 30
+        npm test
+
+    The header is the maximal contiguous run of leading lines that
+    match a recognised metadata key (session / action / cwd /
+    timeout / attend) — the same `_HEADER_LINE` grammar and the same
+    value handling as `_parse_shell_body`, which does the actual
+    parsing. The first line that is not a recognised-key line ends
+    the header; everything from there on is the body, even lines that
+    look like metadata. Recognised header lines never reach the
+    shell.
+
+    Returns None when the text does not begin with a metadata line
+    (it is then bare text, handled by the caller's bare rung).
+    Raises PayloadError — fail closed, nothing executes — when a
+    header line carries an invalid value, or when the payload is
+    metadata with no command body.
+    """
+    lines = text.split("\n")
+    idx = 0
+    while idx < len(lines):
+        match = _HEADER_LINE.match(lines[idx])
+        if not match:
+            break
+        key, value = match.group(1).lower(), match.group(2)
+        if key == "attend" and value \
+                and value.lower() not in _ATTEND_VALUES:
+            raise PayloadError(
+                f"bad attend in payload header: {value!r} "
+                f"(expected true or false)")
+        idx += 1
+    if idx == 0:
+        return None
+    # Same grammar, same assignments, same timeout validation: the
+    # fenced body parser cannot tell this text was never fenced.
+    payload = _parse_shell_body(text, {})
+    payload.raw = text
+    if not payload.command.strip():
+        raise PayloadError(
+            "unfenced payload has a metadata header but no command")
     return payload
 
 
@@ -218,17 +295,25 @@ def parse_clipboard_text(text: str, *, allow_bare: bool = False) -> Payload | No
 
         1. ```shell fence (metadata header + commands)
         2. ```file / ```patch fences (mutation payloads)
-        3. bare clipboard text -> a single unbound command
+        3. unfenced text beginning with a metadata header — the
+           fence's contents as copied by UIs that strip the fence
+           (Microsoft 365 Copilot's copy button)
+        4. bare clipboard text -> a single unbound command
 
     The fence/metadata layer is progressive enhancement over "whatever
     is on the clipboard runs" — never a requirement for the simple
-    case (Ali's hotkey-run tool already worked this way). Bare text is
-    only accepted when `allow_bare` is set: the explicit trigger path
+    case (Ali's hotkey-run tool already worked this way). Rungs 1–3
+    are payload forms: a fence or a metadata header is a deliberate
+    protocol act, accepted wherever payloads are. Bare text is only
+    accepted when `allow_bare` is set: the explicit trigger path
     (the human hit the hotkey and ran the CLI) passes True; the passive
     watch loop passes False so arbitrary clipboard content never
     auto-executes.
     """
     payload = parse_payload(text)
+    if payload is not None:
+        return payload
+    payload = _parse_unfenced(text)
     if payload is not None or not allow_bare:
         return payload
     stripped = text.strip()

@@ -182,6 +182,83 @@ def test_oversized_payload_rejected_before_anything(make_runner):
     assert executor.calls == []
 
 
+# -- unfenced payloads (fence-stripped copies, e.g. M365 Copilot) -------------
+
+UNFENCED_ACCEPTANCE = (
+    "session: clip-harness-smoke\n"
+    "timeout: 30\n"
+    "printf 'clip_harness_smoke=ok\\n'")
+
+
+def test_unfenced_run_executes_body_only_with_footer(make_runner):
+    executor = FakeExecutor(output="clip_harness_smoke=ok\n")
+    runner = make_runner(executor=executor)
+    outcome = runner.process_text(UNFENCED_ACCEPTANCE, "/tmp",
+                                  allow_bare=True)
+    assert outcome.state == RunState.COMPLETED
+    # Exactly the body ran — the metadata lines never reached the shell.
+    assert executor.calls == ["printf 'clip_harness_smoke=ok\\n'"]
+    block = outcome.result_block
+    assert "clip_harness_smoke=ok" in block
+    assert "[exit 0" in block
+    assert "command not found" not in block
+    # Bound footer rides exactly as a fenced run's does.
+    assert "[goal]" in block and "[open tasks]" in block
+
+
+def test_unfenced_recognised_on_watch_path(make_runner):
+    # A metadata header is a payload form, not bare text: the passive
+    # watch path (allow_bare=False) runs it too.
+    executor = FakeExecutor()
+    runner = make_runner(executor=executor)
+    outcome = runner.process_text(UNFENCED_ACCEPTANCE, "/tmp",
+                                  allow_bare=False)
+    assert outcome.state == RunState.COMPLETED
+    assert executor.calls == ["printf 'clip_harness_smoke=ok\\n'"]
+
+
+def test_unfenced_goal_set_and_task_add(make_runner):
+    runner = make_runner()
+    goal = runner.process_text(
+        "session: velocity-navigator\n"
+        "action: goal-set\n"
+        "Build the offline, discovery-first Velocity Navigator "
+        "foundation without pivoting.",
+        "/tmp", allow_bare=True)
+    assert goal.state == RunState.COMPLETED
+    assert ("[goal] Build the offline, discovery-first Velocity "
+            "Navigator foundation without pivoting. [active]"
+            in goal.result_block)
+    tasks = runner.process_text(
+        "session: velocity-navigator\n"
+        "action: task-add\n"
+        "Survey the repo\nWrite the plan",
+        "/tmp", allow_bare=True)
+    assert tasks.state == RunState.COMPLETED
+    assert ("[open tasks] [open] Survey the repo · [open] Write the plan"
+            in tasks.result_block)
+
+
+def test_unfenced_malformed_metadata_denied_nothing_runs(
+        make_runner, clipboard):
+    executor = FakeExecutor()
+    runner = make_runner(executor=executor)
+    outcome = runner.process_text(
+        "session: s1\ntimeout: soon\necho hi", "/tmp", allow_bare=True)
+    assert outcome.state == RunState.DENIED
+    assert executor.calls == []
+    assert clipboard.text.startswith("⛔ clip-harness: malformed payload")
+
+
+def test_unfenced_metadata_only_denied_nothing_runs(make_runner):
+    executor = FakeExecutor()
+    runner = make_runner(executor=executor)
+    outcome = runner.process_text("session: s1\ntimeout: 30", "/tmp",
+                                  allow_bare=True)
+    assert outcome.state == RunState.DENIED
+    assert executor.calls == []
+
+
 # -- gate behavior through the runner ----------------------------------------------
 
 def test_builtin_hard_block_denies(make_runner):

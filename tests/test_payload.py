@@ -147,3 +147,130 @@ def test_attend_header_opts_into_inline_review():
     assert payload.command == "echo hi"
     plain = parse_payload("```shell\necho hi\n```")
     assert plain.attend is False
+
+
+# -- the unfenced form (fence-stripped copies, e.g. M365 Copilot) --------
+#
+# Some chat UIs copy a code block's contents without the outer fence.
+# Text that BEGINS with a metadata header parses as that shell payload;
+# anything else keeps today's behavior exactly.
+
+ACCEPTANCE_UNFENCED = (
+    "session: clip-harness-smoke\n"
+    "timeout: 30\n"
+    "printf 'clip_harness_smoke=ok\\n'")
+
+
+def test_unfenced_acceptance_example():
+    payload = parse_clipboard_text(ACCEPTANCE_UNFENCED, allow_bare=True)
+    assert payload is not None
+    assert payload.session_id == "clip-harness-smoke"
+    assert payload.bound is True
+    assert payload.timeout == 30.0
+    # The executed command is exactly the body — header lines never
+    # reach the shell.
+    assert payload.command == "printf 'clip_harness_smoke=ok\\n'"
+
+
+def test_unfenced_is_a_payload_form_not_bare_text():
+    # Recognised on the watch path too (allow_bare=False): a metadata
+    # header is a deliberate protocol act, like a fence.
+    payload = parse_clipboard_text(ACCEPTANCE_UNFENCED, allow_bare=False)
+    assert payload is not None
+    assert payload.command == "printf 'clip_harness_smoke=ok\\n'"
+
+
+def test_unfenced_full_header():
+    payload = parse_clipboard_text(
+        "session: s1\ncwd: /tmp/x\nattend: true\necho hi",
+        allow_bare=True)
+    assert payload.session_id == "s1"
+    assert payload.cwd == "/tmp/x"
+    assert payload.attend is True
+    assert payload.command == "echo hi"
+
+
+def test_unfenced_goal_set_action():
+    # The exact shape observed failing in M365: an action payload
+    # whose fence the copy button stripped.
+    payload = parse_clipboard_text(
+        "session: velocity-navigator\n"
+        "action: goal-set\n"
+        "Build the offline, discovery-first Velocity Navigator "
+        "foundation without pivoting.",
+        allow_bare=True)
+    assert payload.session_id == "velocity-navigator"
+    assert payload.action == "goal-set"
+    assert payload.command == (
+        "Build the offline, discovery-first Velocity Navigator "
+        "foundation without pivoting.")
+
+
+def test_unfenced_task_add_action():
+    payload = parse_clipboard_text(
+        "session: s1\naction: task-add\nFirst task\nSecond task",
+        allow_bare=True)
+    assert payload.action == "task-add"
+    assert payload.command == "First task\nSecond task"
+
+
+def test_unfenced_unknown_first_line_stays_bare():
+    # `foo:` is not a recognised key — the whole text is a bare
+    # command, exactly as before this form existed.
+    payload = parse_clipboard_text("foo: bar\necho hi", allow_bare=True)
+    assert payload.session_id is None
+    assert payload.command == "foo: bar\necho hi"
+    assert parse_clipboard_text("foo: bar\necho hi",
+                                allow_bare=False) is None
+
+
+def test_unfenced_bad_timeout_fails_closed():
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("session: s1\ntimeout: soon\necho hi",
+                             allow_bare=True)
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("timeout: soon\necho hi", allow_bare=False)
+
+
+def test_unfenced_bad_attend_fails_closed():
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("attend: maybe\necho hi", allow_bare=True)
+
+
+def test_unfenced_metadata_only_is_malformed():
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("session: s1\ntimeout: 30", allow_bare=True)
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("session: s1\naction: goal-set",
+                             allow_bare=True)
+
+
+def test_unfenced_metadata_after_body_is_shell_text():
+    # Once the body begins, a `session:` line is ordinary shell text.
+    payload = parse_clipboard_text(
+        "session: s1\necho one\nsession: not-a-header\necho two",
+        allow_bare=True)
+    assert payload.session_id == "s1"
+    assert payload.command == "echo one\nsession: not-a-header\necho two"
+
+
+def test_unfenced_header_line_alone_is_not_bare():
+    # A metadata-only paste must fail closed even on the trigger path —
+    # never fall through to executing the header as a bare command.
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("session: s1", allow_bare=True)
+
+
+def test_unfenced_parse_payload_alone_still_none():
+    # parse_payload is the fenced ladder only; the unfenced rung
+    # lives in parse_clipboard_text.
+    assert parse_payload(ACCEPTANCE_UNFENCED) is None
+
+
+def test_fenced_form_unchanged_by_unfenced_rung():
+    payload = parse_clipboard_text(
+        "```shell\nsession: s1\ntimeout: 30\necho fenced\n```",
+        allow_bare=True)
+    assert payload.session_id == "s1"
+    assert payload.timeout == 30.0
+    assert payload.command == "echo fenced"

@@ -119,7 +119,10 @@ requirement for the simple case:
 
 1. **```shell fence** — commands with a metadata header.
 2. **```file / ```patch fences** — proposed file changes.
-3. **Bare clipboard text** — treated as a single unbound command
+3. **Unfenced contents beginning with a metadata header** — the
+   shell fence's contents standing alone, when the fence was lost
+   in copying (see "When the fence is lost in copying", below).
+4. **Bare clipboard text** — treated as a single unbound command
    (only on the explicit trigger path; the passive `watch` loop never
    auto-runs bare text).
 
@@ -152,6 +155,33 @@ text. Recognised keys:
   anything else, or absent, is async.
 
 (```run is accepted as a legacy alias for ```shell.)
+
+### When the fence is lost in copying
+
+The canonical form is the fence — models emit fences, always. But
+some chat UIs strip the outer fence when the human copies with the
+block's copy button (Microsoft 365 Copilot does this), leaving the
+block's contents on the clipboard. The harness therefore also
+recognises those contents standing alone: text that **begins** with
+a metadata header — a contiguous run of recognised `key:` lines from
+line 1 — parses as that shell payload. The header is consumed as
+metadata and never passed to the shell; the remaining lines are the
+command, and goal/task `action:` payloads work identically. Bound
+runs get the same manifest and sticky footer as fenced runs.
+
+This is a tolerance for a copying artifact, not a second format:
+
+- Text that does not begin with a recognised metadata line is not
+  an unfenced payload — it is bare text (rung 4), as before. An
+  unrecognised first line (e.g. `foo: bar`) starts no header.
+- A recognised key with an invalid value inside the header
+  (`timeout: soon`, `attend: maybe`) is malformed metadata: the
+  payload is rejected and nothing executes — it never falls back
+  to running the header as shell text.
+- A metadata line appearing after the command body has begun is
+  ordinary shell text, never re-parsed.
+- Metadata with no command body is rejected. File and patch fences
+  have no unfenced form.
 
 ### Execution modes
 

@@ -1112,6 +1112,56 @@ def case_45(env: Env):
           f"a plain command parked a candidate: {listing.stdout!r}")
 
 
+def case_46(env: Env):
+    # M365 Copilot's copy button strips the ``` fence: the block's
+    # contents alone must parse as the payload (the acceptance case).
+    proc = env.run_payload(
+        "session: clip-harness-smoke\n"
+        "timeout: 30\n"
+        "printf 'clip_harness_smoke=ok\\n'")
+    check(proc.returncode == 0, proc.stderr)
+    block = env.clip_text()
+    check("clip_harness_smoke=ok" in block,
+          f"unfenced body did not run: {block!r}")
+    check("[exit 0" in block, f"unfenced run not clean: {block!r}")
+    check("command not found" not in block,
+          f"metadata lines reached the shell: {block!r}")
+    check("[goal]" in block and "[open tasks]" in block,
+          f"bound footer missing on unfenced run: {block!r}")
+    artifact_check(env, proc, "(case 46)")
+    # Unfenced goal/task ops bind the same session; the next unfenced
+    # run's footer must show that session's goal and tasks.
+    proc = env.run_payload(
+        "session: clip-harness-smoke\n"
+        "action: goal-set\n"
+        "Smoke the unfenced form")
+    check(proc.returncode == 0, proc.stderr)
+    proc = env.run_payload(
+        "session: clip-harness-smoke\n"
+        "action: task-add\n"
+        "Check the footer")
+    check(proc.returncode == 0, proc.stderr)
+    proc = env.run_payload(
+        "session: clip-harness-smoke\n"
+        "printf 'again=ok\\n'")
+    check(proc.returncode == 0, proc.stderr)
+    block = env.clip_text()
+    check("[goal] Smoke the unfenced form [active]" in block,
+          f"footer goal wrong after unfenced ops: {block!r}")
+    check("[open tasks] [open] Check the footer" in block,
+          f"footer tasks wrong after unfenced ops: {block!r}")
+    # Malformed metadata fails closed: error note, nothing executed.
+    proc = env.run_payload("session: s46\ntimeout: soon\necho never")
+    check(proc.returncode == 0, proc.stderr)
+    check(env.clip_text().startswith("⛔ clip-harness: malformed payload"),
+          f"malformed unfenced not rejected: {env.clip_text()!r}")
+    rejected = env.events("PayloadCaptured")[-1]
+    check(rejected["data"]["status"] == "rejected",
+          f"malformed run not receipted as rejected: {rejected}")
+    check(env.events("PostRun", run_id=rejected["run_id"]) == [],
+          "malformed unfenced payload produced a PostRun")
+
+
 # =======================================================================
 # Matrix runner
 # =======================================================================

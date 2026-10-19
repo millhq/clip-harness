@@ -91,6 +91,23 @@ def _runner(settings, **overrides) -> LifecycleRunner:
     return LifecycleRunner(**kwargs)
 
 
+def _stream_kwargs() -> dict:
+    """Live run visibility for the interactive entries: enabled only
+    when a human is watching a real terminal (stdout is a TTY). The
+    sink writes output chunks verbatim — no paint, since rendering
+    applies to finished blocks — while the run header still goes
+    through the presenter. The watch entries never call this: they
+    are passive and stay byte-identical to before."""
+    if not sys.stdout.isatty():
+        return {}
+
+    def _sink(text: str) -> None:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    return {"stream_output": True, "stream_sink": _sink}
+
+
 # ----------------------------------------------------------------------
 # Commands
 # ----------------------------------------------------------------------
@@ -107,8 +124,10 @@ def cmd_trigger(args) -> int:
     if not text:
         return 0
     # The human fired the trigger: a staged candidate is reviewed
-    # inline, in this invocation (deferring parks it as usual).
-    runner = _runner(settings, clipboard=clipboard, inline_review=True)
+    # inline, in this invocation (deferring parks it as usual), and
+    # a running command is visible live on the terminal.
+    runner = _runner(settings, clipboard=clipboard, inline_review=True,
+                     **_stream_kwargs())
     outcome = runner.process_text(text, os.getcwd(), allow_bare=True)
     if outcome is None:
         return 0
@@ -156,7 +175,7 @@ def cmd_run(args) -> int:
             print("clip-harness: no clipboard available", file=sys.stderr)
             return 1
         text = clipboard.get_text() or ""
-    runner = _runner(settings, inline_review=True)
+    runner = _runner(settings, inline_review=True, **_stream_kwargs())
     outcome = runner.process_text(text, os.getcwd(), allow_bare=True)
     if outcome is None:
         print("clip-harness: no payload found", file=sys.stderr)

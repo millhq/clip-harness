@@ -64,6 +64,9 @@ class RunOutcome:
 class LifecycleRunner:
     def __init__(self, *, settings: Settings, clipboard=None, decider=None,
                  diff_opener=None, inline_review: bool = False,
+                 stream_output: bool = False,
+                 stream_sink: Callable[[str], None] | None = None,
+                 heartbeat_interval: float | None = None,
                  presenter: Callable[[str], None] = print,
                  executor: Executor | None = None,
                  session_id: str | None = None,
@@ -80,6 +83,16 @@ class LifecycleRunner:
         # candidate is decided inline in the same invocation. The
         # watch entries leave it False — watched runs always park.
         self.inline_review = inline_review
+        # Same wiring shape for live run visibility: True only on the
+        # interactive entries at a real terminal (cli.py gates on the
+        # TTY), so `_execute` presents a run header and streams the
+        # command's output to the terminal as it is produced. Pure
+        # presentation — the captured output, spill file, receipts
+        # and result block are untouched; the watch and headless
+        # entries leave it False and run byte-identically to before.
+        self.stream_output = stream_output
+        self.stream_sink = stream_sink
+        self.heartbeat_interval = heartbeat_interval
         self.presenter = presenter
         self.executor = executor or LocalExecutor()
         self.session_id = session_id or f"sess-{time.strftime('%Y%m%d')}"
@@ -575,6 +588,19 @@ class LifecycleRunner:
     # Execution + post events
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _run_header(command: str, cwd: str, timeout: float,
+                    binding_id: str | None) -> str:
+        """The live-run header presented on the terminal just before
+        a command executes — what is running, where, under which
+        session and time bound. Presentation only: it goes through
+        the presenter channel and never enters the captured output
+        or the result block."""
+        meta = f"cwd: {cwd} · timeout: {timeout:g}s"
+        if binding_id:
+            meta += f" · session: {binding_id}"
+        return f"$ {command}\n  {meta}"
+
     def _execute(self, ctx: RunContext, handle: RunHandle, command: str,
                  cwd: str, timeout: float,
                  files_section: str) -> RunOutcome:
@@ -590,9 +616,20 @@ class LifecycleRunner:
                         handle.request_cancel()
                         break
             threading.Thread(target=_watch_flag, daemon=True).start()
+        run_kwargs: dict = {}
+        if self.stream_output:
+            self.presenter(self._run_header(command, cwd, timeout,
+                                            handle.binding_id))
+            run_kwargs["sink"] = (self.stream_sink
+                                  if self.stream_sink is not None
+                                  else self.presenter)
+            if self.heartbeat_interval is not None:
+                run_kwargs["heartbeat_interval"] = \
+                    self.heartbeat_interval
         result = self.executor.run(command, cwd, timeout,
                                    handle.cancel_event(),
-                                   Path(handle.output_file))
+                                   Path(handle.output_file),
+                                   **run_kwargs)
         stop.set()
         ctx.result = result
         duration_ms = int(result.elapsed * 1000)

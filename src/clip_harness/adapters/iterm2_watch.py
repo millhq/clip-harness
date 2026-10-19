@@ -57,7 +57,12 @@ class ITerm2TabExecutor:
 
     def run(self, command: str, cwd, timeout: float,
             cancel_event: threading.Event,
-            output_path: Path) -> ExecResult:
+            output_path: Path, sink=None,
+            heartbeat_interval: float | None = None) -> ExecResult:
+        # sink / heartbeat_interval are accepted for interface parity
+        # with LocalExecutor and ignored: the command runs visibly in
+        # its own iTerm2 tab (that IS the live view), and the watch
+        # wiring never enables streaming anyway.
         future = asyncio.run_coroutine_threadsafe(
             self._run_in_tab(command, str(cwd), timeout, cancel_event,
                              Path(output_path)),

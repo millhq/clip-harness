@@ -221,6 +221,16 @@ blocked waiting on output.
   the decision (see the review gate below).
   This holds for attended payloads and pure file/patch payloads
   alike. Plain commands just run.
+- **Live run visibility (trigger / `run`, at a terminal).** While
+  a command executes, the terminal shows a header — the command,
+  its cwd, the bound session, the timeout — and then the output
+  itself as it is produced, with a `… running Ns` heartbeat when
+  the command goes quiet; the run's `output.txt` fills as it goes,
+  so `tail -f` works mid-run too. This is a view, not a second
+  artifact: the result block still arrives complete at the end,
+  byte-for-byte what a silent run produces, and the clipboard,
+  receipts and files never see the header or the heartbeat. The
+  watch loops and non-terminal invocations don't stream.
 - **Parked (deferred / watch).** Deferring at the trigger prompt —
   or any payload with file changes under the `watch` loops, which
   never prompt — **parks** the run: the candidate is staged, the

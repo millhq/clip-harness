@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clip-harness"
-version = "0.1.4"
+version = "0.1.5"
 description = "A human-in-the-loop execution bridge: run AI-chat-proposed commands from your clipboard, behind a Claude Code-style hook lifecycle with a fail-closed review gate."
 readme = "README.md"
 license = { text = "MIT" }

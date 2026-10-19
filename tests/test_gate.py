@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 from clip_harness.core import Decision, FileSpec
-from clip_harness.gate import (DecisionRecord, apply_candidate,
+from clip_harness.gate import (DecisionRecord, GateError,
+                               _validate_patch_target, apply_candidate,
                                classify_and_stage, evaluate_policy,
                                looks_like_mutation)
 from clip_harness.settings import Settings
@@ -377,3 +378,108 @@ def test_patch_without_trailing_newline_still_applies(tmp_path):
     entry = candidate.entries[0]
     staged = (candidate.dir / "candidates" / entry.candidate_file)
     assert staged.read_text() == "a\nB\nc\n"
+
+
+# -- patch targeting: `path:` is authoritative, headers are checked --
+#
+# Regression (field report): the patch engine applied the RAW diff
+# text, so git resolved the ---/+++ header filenames from the
+# harness process cwd — an absolute `path:` with repo-relative or
+# basename headers failed ("No such file or directory" / "invalid
+# path") unless the trigger happened to stand in the right
+# directory. Headers are now validated against the target and
+# normalized to its basename before git sees them.
+
+_BODY = "@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"
+
+
+def _patch(old: str, new: str) -> str:
+    return f"--- {old}\n+++ {new}\n{_BODY}"
+
+
+def test_patch_header_matrix_consistent(tmp_path):
+    target = tmp_path / "project" / "file.txt"
+    declared_forms = [
+        # (declared path:, ---/+++ header names)
+        ("file.txt", ("a/file.txt", "b/file.txt")),          # a//b/ prefix
+        ("project/file.txt", ("a/project/file.txt",
+                              "b/project/file.txt")),        # equal
+        (str(target), (str(target), str(target))),           # absolute
+        (str(target), ("a/project/file.txt",
+                       "b/project/file.txt")),               # suffix
+        (str(target), ("a/file.txt", "b/file.txt")),         # suffix-1
+        (str(target), ("file.txt", "file.txt")),             # basename
+        (str(target), ("a/project/file.txt", "b/file.txt")),  # mixed forms
+    ]
+    for declared, (old, new) in declared_forms:
+        sections = _validate_patch_target(
+            _patch(old, new), declared, target)
+        assert sections[0][1:] == (old, new), (declared, old, new)
+
+
+def test_patch_header_matrix_rejected(tmp_path):
+    target = tmp_path / "project" / "file.txt"
+    bad = [
+        _patch("a/other.txt", "b/other.txt"),        # a different file
+        _patch("a/project/other.txt", "b/project/other.txt"),
+        _patch("a/file.txt", "b/other.txt"),         # --- vs +++ disagree
+        _patch(str(tmp_path / "elsewhere.txt"),
+               str(tmp_path / "elsewhere.txt")),     # absolute, wrong file
+        "@@ -1 +1 @@\n-x\n+y\n",                     # no headers at all
+    ]
+    for patch in bad:
+        with pytest.raises(GateError):
+            _validate_patch_target(patch, str(target), target)
+
+
+def test_patch_devnull_sides_need_no_match_on_the_null_side(tmp_path):
+    target = tmp_path / "project" / "file.txt"
+    # Creation: the /dev/null side is unchecked, b/ side must match.
+    sections = _validate_patch_target(
+        "--- /dev/null\n+++ b/file.txt\n@@ -0,0 +1 @@\n+x\n",
+        str(target), target)
+    assert sections[0][1] == "/dev/null"
+    # Deletion: mirror image.
+    sections = _validate_patch_target(
+        "--- a/file.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n",
+        str(target), target)
+    assert sections[0][2] == "/dev/null"
+    # But a /dev/null partner does not excuse a wrong named side.
+    with pytest.raises(GateError):
+        _validate_patch_target(
+            "--- /dev/null\n+++ b/other.txt\n@@ -0,0 +1 @@\n+x\n",
+            str(target), target)
+
+
+def test_patch_abs_path_suffix_headers_from_other_cwd(tmp_path):
+    # The field repro at gate level: target named absolutely, diff
+    # headers repo-relative, staging cwd standing elsewhere.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    target = tmp_path / "repo" / "suppliers" / "helm" / "normalize"
+    target.parent.mkdir(parents=True)
+    target.write_text("one\ntwo\nthree\n")
+    patch = _patch("a/suppliers/helm/normalize",
+                   "b/suppliers/helm/normalize")
+    candidate = _stage(tmp_path, [FileSpec(path=str(target),
+                                           patch=patch)], elsewhere)
+    entry = candidate.entries[0]
+    assert entry.actual_op == "UPDATE"
+    assert entry.abs_path == str(target)
+    staged = (candidate.dir / "candidates" / entry.candidate_file)
+    assert staged.read_text() == "one\nTWO\nthree\n"
+    assert target.read_text() == "one\ntwo\nthree\n"  # live untouched
+
+
+def test_patch_create_and_delete_via_devnull(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    create = ("--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+born\n")
+    candidate = _stage(tmp_path, [FileSpec(path="new.txt",
+                                           patch=create)], work)
+    assert candidate.entries[0].actual_op == "NEW"
+    (work / "old.txt").write_text("gone\n")
+    delete = ("--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n")
+    candidate = _stage(tmp_path, [FileSpec(path="old.txt",
+                                           patch=delete)], work)
+    assert candidate.entries[0].actual_op == "DELETE"

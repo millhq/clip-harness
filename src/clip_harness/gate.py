@@ -359,34 +359,185 @@ def _count_diff(old: bytes | None, new: bytes | None) -> tuple[int, int]:
     return added, removed
 
 
-def _apply_patch(live: bytes | None, patch_text: str, rel_path: str) -> bytes:
-    """Turn a unified diff into candidate content by delegating to git —
-    the core maps onto the known tool instead of reimplementing patching.
+# ---------------------------------------------------------------------------
+# Patch targeting — `path:` is the authoritative target
+# ---------------------------------------------------------------------------
+#
+# A patch payload names its target with `path:`; the unified diff's
+# ---/+++ header filenames are the model's own bookkeeping (repo-
+# relative a//b/ paths, basenames, absolute paths — whichever it
+# produced from wherever it was standing). They must agree with
+# `path:`, but they never DIRECT the apply: headers are normalized
+# to the target's basename and git applies the diff to the live
+# bytes under that name, so neither the harness process cwd nor the
+# header shape can steer the change to a different file.
+
+_HUNK_HEADER_RE = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _header_name(raw: str) -> str:
+    """The filename from a ---/+++ header line's remainder: drop any
+    tab-separated timestamp, and C-style quoting git adds around
+    names with special characters."""
+    name = raw.split("\t")[0].strip()
+    if len(name) >= 2 and name.startswith('"') and name.endswith('"'):
+        name = name[1:-1]
+    return name
+
+
+def _patch_sections(patch_text: str) -> list[tuple[int, str, str]]:
+    """(line index, old name, new name) per file section in a diff.
+
+    Header pairs are ---/+++ line pairs found OUTSIDE hunk bodies;
+    hunk bodies are consumed by the line counts their @@ headers
+    declare, so a removed line whose content starts with '--' is
+    never mistaken for a file header.
     """
+    lines = patch_text.splitlines()
+    sections: list[tuple[int, str, str]] = []
+    i = 0
+    while i < len(lines):
+        hunk = _HUNK_HEADER_RE.match(lines[i])
+        if hunk:
+            old_left = int(hunk.group(2)) if hunk.group(2) else 1
+            new_left = int(hunk.group(4)) if hunk.group(4) else 1
+            i += 1
+            while i < len(lines) and (old_left > 0 or new_left > 0):
+                line = lines[i]
+                if line.startswith("\\"):
+                    pass  # "\ No newline at end of file"
+                elif line.startswith("-"):
+                    old_left -= 1
+                elif line.startswith("+"):
+                    new_left -= 1
+                else:  # context (incl. a bare empty line)
+                    old_left -= 1
+                    new_left -= 1
+                i += 1
+            continue
+        if lines[i].startswith("--- ") and i + 1 < len(lines) \
+                and lines[i + 1].startswith("+++ "):
+            sections.append((i, _header_name(lines[i][4:]),
+                             _header_name(lines[i + 1][4:])))
+            i += 2
+            continue
+        i += 1
+    return sections
+
+
+def _strip_ab_prefix(name: str) -> str:
+    if name.startswith(("a/", "b/")):
+        return name[2:]
+    return name
+
+
+def _header_matches_target(name: str, spec_path: str,
+                           abs_path: Path) -> bool:
+    """Is a ---/+++ header name a plausible reference to the
+    authoritative target? Consistent iff, modulo a conventional
+    a//b/ prefix, it equals the declared path, equals the resolved
+    target, is a repo-relative suffix of the resolved target, or is
+    the target's basename. Anything else names a different file."""
+    bare = _strip_ab_prefix(name)
+    abs_str = str(abs_path)
+    return (name == spec_path or bare == spec_path
+            or name == abs_str or bare == abs_str
+            or abs_str.endswith("/" + bare)
+            or abs_str.endswith("/" + name)
+            or bare == abs_path.name)
+
+
+def _validate_patch_target(patch_text: str, spec_path: str,
+                           abs_path: Path) -> list[tuple[int, str, str]]:
+    """The patch's header sections, checked against `path:`.
+
+    Fails closed (GateError) when the patch carries no ---/+++
+    headers at all, when a header names a genuinely different
+    file, or when --- and +++ disagree with each other. A /dev/null
+    side (creation / deletion) needs no check; the other side must
+    still name the target.
+    """
+    sections = _patch_sections(patch_text)
+    if not sections:
+        raise GateError(
+            f"patch for {spec_path} has no ---/+++ file headers — "
+            "cannot establish that it targets that file")
+    for _index, old, new in sections:
+        for name in (old, new):
+            if name == "/dev/null":
+                continue
+            if not _header_matches_target(name, spec_path, abs_path):
+                raise GateError(
+                    f"patch for {spec_path} names a different file "
+                    f"in its headers: {name!r}")
+        if old != "/dev/null" and new != "/dev/null":
+            old_bare = _strip_ab_prefix(old)
+            new_bare = _strip_ab_prefix(new)
+            if old_bare != new_bare \
+                    and not old_bare.endswith("/" + new_bare) \
+                    and not new_bare.endswith("/" + old_bare):
+                raise GateError(
+                    f"patch for {spec_path} has disagreeing headers: "
+                    f"{old!r} vs {new!r}")
+    return sections
+
+
+def _normalize_patch(patch_text: str,
+                     sections: list[tuple[int, str, str]],
+                     abs_path: Path) -> str:
+    """The working copy of the patch with every header rewritten to
+    the target's basename under conventional a//b/ prefixes
+    (/dev/null sides preserved) — the form git applies, from the
+    scratch dir holding the target under that basename."""
+    base = abs_path.name
+    lines = patch_text.splitlines()
+    for index, old, new in sections:
+        lines[index] = ("--- /dev/null" if old == "/dev/null"
+                        else f"--- a/{base}")
+        lines[index + 1] = ("+++ /dev/null" if new == "/dev/null"
+                            else f"+++ b/{base}")
+    for index, line in enumerate(lines):
+        if line.startswith("diff --git "):
+            lines[index] = f"diff --git a/{base} b/{base}"
+    text = "\n".join(lines)
+    # git apply requires newline-terminated lines; the payload
+    # parser strips the fence's trailing newline, so restore it.
+    return text if text.endswith("\n") else text + "\n"
+
+
+def _apply_patch(live: bytes | None, patch_text: str, spec_path: str,
+                 abs_path: Path) -> bytes | None:
+    """Turn a unified diff into candidate content by delegating to
+    git — the core maps onto the known tool instead of
+    reimplementing patching.
+
+    `path:` (resolved to `abs_path`) is the authoritative target:
+    the diff's headers are validated against it and normalized to
+    its basename before git sees them, and application runs in a
+    scratch dir holding the live bytes under that basename — the
+    harness process cwd is irrelevant. Returns the post-patch
+    bytes, or None when the patch deletes the file.
+    """
+    sections = _validate_patch_target(patch_text, spec_path, abs_path)
+    normalized = _normalize_patch(patch_text, sections, abs_path)
     with tempfile.TemporaryDirectory(prefix="clip-harness-patch-") as tmp:
         root = Path(tmp)
-        target = root / rel_path
-        target.parent.mkdir(parents=True, exist_ok=True)
+        target = root / abs_path.name
         if live is not None:
             target.write_bytes(live)
         patch_file = root / "change.patch"
-        # git apply requires newline-terminated lines; the payload
-        # parser strips the fence's trailing newline, so restore it.
-        if not patch_text.endswith("\n"):
-            patch_text += "\n"
-        patch_file.write_text(patch_text, encoding="utf-8")
-        for strip in (None, "-p0"):
-            cmd = ["git", "apply", "--whitespace=nowarn"]
-            if strip:
-                cmd.append(strip)
-            cmd.append(str(patch_file))
-            proc = subprocess.run(cmd, cwd=root, capture_output=True,
-                                  text=True, timeout=30)
-            if proc.returncode == 0:
-                return target.read_bytes()
-        raise GateError(
-            f"patch for {rel_path} does not apply cleanly: "
-            f"{proc.stderr.strip()[:300]}")
+        patch_file.write_text(normalized, encoding="utf-8")
+        proc = subprocess.run(
+            ["git", "apply", "--whitespace=nowarn", str(patch_file)],
+            cwd=root, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            raise GateError(
+                f"patch for {spec_path} does not apply cleanly: "
+                f"{proc.stderr.strip()[:300]}")
+        if not target.exists():
+            return None  # the patch deleted the file
+        return target.read_bytes()
 
 
 def classify_and_stage(candidate_dir: Path, run_id: str,
@@ -420,7 +571,8 @@ def classify_and_stage(candidate_dir: Path, run_id: str,
         if spec.declared_op == "delete":
             candidate_bytes = None
         elif spec.is_patch:
-            candidate_bytes = _apply_patch(live, spec.patch or "", spec.path)
+            candidate_bytes = _apply_patch(live, spec.patch or "",
+                                           spec.path, abs_path)
         else:
             candidate_bytes = (spec.content or "").encode("utf-8")
 

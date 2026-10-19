@@ -1324,6 +1324,178 @@ def case_50(env: Env):
 
 
 # =======================================================================
+# Patch targeting (51-56): `path:` is authoritative — the diff's
+# ---/+++ headers are checked against it and normalized to it, so a
+# patch stages and applies from ANY trigger cwd.
+# =======================================================================
+
+_HELM_BODY = ("@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n")
+
+
+def _trigger_stage(env: Env, clipboard_text: str) -> str:
+    env.clip.write_text(clipboard_text, encoding="utf-8")
+    proc = env.trigger()
+    check(proc.returncode == 0, proc.stderr)
+    check("awaiting review" in env.clip_text(),
+          f"payload did not park: {env.clip_text()!r}")
+    return env.candidate_id()
+
+
+def case_51(env: Env):
+    # (a) Absolute path: + repo-relative a//b/ headers, unfenced,
+    # through the zero-arg trigger standing in another directory.
+    target = env.root / "repo" / "suppliers" / "helm" / "normalize"
+    target.parent.mkdir(parents=True)
+    target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    sibling = target.parent / "sibling.txt"
+    sibling.write_text("leave me\n", encoding="utf-8")
+    cid = _trigger_stage(env,
+                         f"path: {target}\n"
+                         "--- a/suppliers/helm/normalize\n"
+                         "+++ b/suppliers/helm/normalize\n"
+                         + _HELM_BODY)
+    entry = env.manifest(cid)["entries"][0]
+    check(entry["path"] == str(target)
+          and entry["abs_path"] == str(target)
+          and entry["actual_op"] == "UPDATE",
+          f"candidate does not name the authoritative target: {entry}")
+    show = env.cli("candidate", "show", cid)
+    check(str(target) in show.stdout and "+TWO" in show.stdout,
+          f"review does not show the target and hunk: {show.stdout!r}")
+    proc = env.cli("candidate", "review", cid, "--decision", "accept")
+    check(proc.returncode == 0, proc.stderr)
+    check(target.read_text(encoding="utf-8") == "one\nTWO\nthree\n",
+          "patch not applied to the absolute target")
+    check(sibling.read_text(encoding="utf-8") == "leave me\n",
+          "a file other than the target was modified")
+    check(f"✓ {target} — UPDATED" in env.clip_text(),
+          f"result does not name the final target: {env.clip_text()!r}")
+
+
+def case_52(env: Env):
+    # (b) Absolute path: + basename-only headers.
+    target = env.root / "elsewhere" / "normalize"
+    target.parent.mkdir(parents=True)
+    target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    cid = _trigger_stage(env,
+                         f"path: {target}\n"
+                         "--- normalize\n"
+                         "+++ normalize\n"
+                         + _HELM_BODY)
+    proc = env.cli("candidate", "review", cid, "--decision", "accept")
+    check(proc.returncode == 0, proc.stderr)
+    check(target.read_text(encoding="utf-8") == "one\nTWO\nthree\n",
+          "basename-header patch not applied to the target")
+    check(f"✓ {target} — UPDATED" in env.clip_text(),
+          f"result does not name the final target: {env.clip_text()!r}")
+
+
+def case_53(env: Env):
+    # (c) The acceptance case, verbatim shape: arbitrary cwd,
+    # path: /tmp/.../project/file.txt, headers a/file.txt b/file.txt,
+    # one hunk. Stages, review names the target, accept modifies
+    # only that file.
+    base = Path("/tmp/clip-harness-patch-acceptance")
+    target = base / "project" / "file.txt"
+    target.unlink(missing_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    try:
+        cid = _trigger_stage(
+            env,
+            f"path: {target}\n"
+            "--- a/file.txt\n"
+            "+++ b/file.txt\n"
+            "@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n")
+        show = env.cli("candidate", "show", cid)
+        check(str(target) in show.stdout and "+BETA" in show.stdout,
+              f"review does not show final path + hunk: {show.stdout!r}")
+        proc = env.cli("candidate", "review", cid,
+                       "--decision", "accept")
+        check(proc.returncode == 0, proc.stderr)
+        check(target.read_text(encoding="utf-8")
+              == "alpha\nBETA\ngamma\n",
+              "acceptance patch not applied")
+        check(f"✓ {target} — UPDATED" in env.clip_text(),
+              f"result does not identify the final target: "
+              f"{env.clip_text()!r}")
+    finally:
+        target.unlink(missing_ok=True)
+        try:
+            target.parent.rmdir()
+            base.rmdir()
+        except OSError:
+            pass
+
+
+def case_54(env: Env):
+    # (d) Headers naming a different file than path: — staging
+    # fails closed: no candidate parks, the target is untouched.
+    target = env.root / "repo" / "file.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    env.clip.write_text(
+        f"path: {target}\n"
+        "--- a/other.txt\n"
+        "+++ b/other.txt\n"
+        + _HELM_BODY, encoding="utf-8")
+    proc = env.trigger()
+    check(proc.returncode == 0, proc.stderr)
+    block = env.clip_text()
+    check("candidate staging failed" in block
+          and "different file" in block,
+          f"disagreeing patch not refused at staging: {block!r}")
+    cands = env.state / "candidates"
+    check(not cands.exists()
+          or not any(cands.rglob("manifest.json")),
+          "a candidate parked for a refused patch")
+    check(target.read_text(encoding="utf-8") == "one\ntwo\nthree\n",
+          "refused patch touched the target")
+
+
+def case_55(env: Env):
+    # (e) Target moves between staging and acceptance — the
+    # base-hash check refuses the apply, as for any mutation.
+    target = env.root / "repo" / "file.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    cid = _trigger_stage(env,
+                         f"path: {target}\n"
+                         "--- a/file.txt\n"
+                         "+++ b/file.txt\n"
+                         + _HELM_BODY)
+    target.write_text("moved\ntwo\nthree\n", encoding="utf-8")
+    proc = env.cli("candidate", "review", cid, "--decision", "accept")
+    check(proc.returncode == 0, proc.stderr)
+    check(target.read_text(encoding="utf-8") == "moved\ntwo\nthree\n",
+          "stale target was overwritten by the apply")
+    check("FAILED" in env.clip_text()
+          and "changed on disk since staging" in env.clip_text(),
+          f"stale apply not refused in the result: {env.clip_text()!r}")
+
+
+def case_56(env: Env):
+    # (f) The fenced form of (a): same absolute target, same
+    # repo-relative headers, inside a ```patch fence.
+    target = env.root / "repo" / "suppliers" / "helm" / "normalize"
+    target.parent.mkdir(parents=True)
+    target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    cid = _trigger_stage(env,
+                         f"```patch\npath: {target}\n"
+                         "--- a/suppliers/helm/normalize\n"
+                         "+++ b/suppliers/helm/normalize\n"
+                         + _HELM_BODY + "```")
+    entry = env.manifest(cid)["entries"][0]
+    check(entry["abs_path"] == str(target)
+          and entry["actual_op"] == "UPDATE",
+          f"fenced patch staged against the wrong target: {entry}")
+    proc = env.cli("candidate", "review", cid, "--decision", "accept")
+    check(proc.returncode == 0, proc.stderr)
+    check(target.read_text(encoding="utf-8") == "one\nTWO\nthree\n",
+          "fenced patch not applied to the absolute target")
+
+
+# =======================================================================
 # Matrix runner
 # =======================================================================
 

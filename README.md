@@ -270,7 +270,9 @@ path: src/tokens.py
 each file against disk — **NEW / UPDATE / DELETE / NO-CHANGE** — and
 flags declared-vs-actual mismatches. File fences with no shell fence
 are a pure mutation payload; a header-only shell fence binds one to a
-session.
+session. For ```patch fences, `path:` is the authoritative target:
+the diff's `---`/`+++` header filenames are checked against it and
+normalized to it before application, whatever shape they arrive in.
 
 ### Control triggers
 

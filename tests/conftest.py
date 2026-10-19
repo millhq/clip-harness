@@ -21,9 +21,12 @@ class FakeExecutor:
         self.output = output
         self.exit_code = exit_code
         self.calls: list[str] = []
+        self.kwargs: list[dict] = []  # per-call executor kwargs
 
-    def run(self, command, cwd, timeout, cancel_event, output_path):
+    def run(self, command, cwd, timeout, cancel_event, output_path,
+            **kwargs):
         self.calls.append(command)
+        self.kwargs.append(kwargs)
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(self.output, encoding="utf-8")

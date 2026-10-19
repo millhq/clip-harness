@@ -1496,6 +1496,110 @@ def case_56(env: Env):
 
 
 # =======================================================================
+# Reviewed shell commands (57-58)
+# =======================================================================
+
+def _sandbox_passthrough(env: Env) -> dict:
+    """A fake sandbox-exec on PATH that records nothing and execs the
+    wrapped command — the Linux stand-in for macOS Seatbelt, so a
+    sandboxed accept can complete end-to-end in CI."""
+    shim_dir = env.root / "shimbin"
+    shim_dir.mkdir(exist_ok=True)
+    shim = shim_dir / "sandbox-exec"
+    shim.write_text("#!/bin/sh\nshift 2\nexec \"$@\"\n", encoding="utf-8")
+    shim.chmod(0o755)
+    return {"PATH": str(shim_dir) + os.pathsep + os.environ["PATH"]}
+
+
+def case_57(env: Env):
+    # (a) Attended mutating shell payload with a declared write
+    # scope: held for review, accepted SANDBOXED through the
+    # decision channel (a decision.json drop while the run waits),
+    # then executed — the file lands inside the declared scope and
+    # the result block records the reviewed run.
+    env.write_file("payload.txt",
+                   "```shell\nsession: reviewed-shell\nattend: true\n"
+                   "writes: dist/raw-evidence\n"
+                   "mkdir -p dist/raw-evidence && "
+                   "printf 'evidence\\n' > dist/raw-evidence/openapi.txt\n"
+                   "```")
+    env_over = {"CLIP_HARNESS_ATTEND_WAIT_S": "60"}
+    env_over.update(_sandbox_passthrough(env))
+    proc, out_path = env.bg("run", "--file", "payload.txt",
+                            env_over=env_over)
+    cands = env.state / "candidates"
+    env.wait_for(lambda: cands.exists()
+                 and any((d / "manifest.json").exists()
+                         for d in cands.iterdir()),
+                 what="command candidate to stage")
+    cid = next(d.name for d in cands.iterdir()
+               if (d / "manifest.json").exists())
+    manifest = env.manifest(cid)
+    check(manifest["kind"] == "command",
+          f"staged candidate is not a command candidate: {manifest}")
+    check(manifest["writes"] == ["dist/raw-evidence"],
+          f"declared scope not recorded: {manifest}")
+    time.sleep(1.0)
+    check(proc.poll() is None,
+          "attended command run returned before any decision")
+    (cands / cid / "decision.json").write_text(json.dumps(
+        {"decision": "accept", "reason": "", "accepted_files": None}),
+        encoding="utf-8")
+    out = env.bg_finish(proc, out_path, timeout=20)
+    created = env.proj / "dist" / "raw-evidence" / "openapi.txt"
+    check(created.read_text(encoding="utf-8") == "evidence\n",
+          "reviewed command did not create the file inside its scope")
+    check("(reviewed · sandboxed)" in out,
+          f"result block does not record the reviewed run: {out!r}")
+    check("(reviewed · sandboxed)" in env.clip_text(),
+          "clipboard block does not record the reviewed run")
+    check("command review" in out and "dist/raw-evidence" in out,
+          f"review surface not presented in the terminal: {out!r}")
+    approved = [e["data"] for e in env.events("ReviewDecision")
+                if e["data"].get("status") == "approved"]
+    check(approved and approved[-1]["mode"] == "sandboxed",
+          f"no sandboxed approval in the receipts: {approved}")
+
+
+def case_58(env: Env):
+    # (b) No human present: a mutating shell payload parks as a
+    # command candidate whose note NAMES the review mechanism, and
+    # `candidate review --decision accept` completes it later.
+    env.clip.write_text(
+        "```shell\nsession: parked-shell\nwrites: dist\n"
+        "mkdir -p dist && printf 'parked\\n' > dist/done.txt\n```",
+        encoding="utf-8")
+    proc = env.trigger()
+    check(proc.returncode == 0, proc.stderr)
+    note = env.clip_text()
+    check("held for review" in note
+          and "clip-harness candidate review" in note,
+          f"parked note does not name the mechanism: {note!r}")
+    cid = env.candidate_id()
+    manifest = env.manifest(cid)
+    check(manifest["kind"] == "command"
+          and manifest["session_id"] == "parked-shell",
+          f"parked manifest is not the command candidate: {manifest}")
+    check(not (env.proj / "dist" / "done.txt").exists(),
+          "parked command executed without a decision")
+    show = env.cli("candidate", "show", cid)
+    check("command review" in show.stdout
+          and "mutates files" in show.stdout
+          and str(env.proj / "dist") in show.stdout,
+          f"show does not present command + scope + reason: "
+          f"{show.stdout!r}")
+    proc = env.cli("candidate", "review", cid, "--decision", "accept",
+                   env_over=_sandbox_passthrough(env))
+    check(proc.returncode == 0, proc.stderr)
+    check((env.proj / "dist" / "done.txt").read_text(encoding="utf-8")
+          == "parked\n",
+          "candidate review did not execute the accepted command")
+    check("(reviewed · sandboxed)" in env.clip_text(),
+          f"completion block lacks the reviewed note: "
+          f"{env.clip_text()!r}")
+
+
+# =======================================================================
 # Matrix runner
 # =======================================================================
 

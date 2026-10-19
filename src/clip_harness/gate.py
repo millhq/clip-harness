@@ -18,6 +18,16 @@ Two layers, per the hooks report (§7):
 
 Anything richer than this (custom classifiers, extra reviewers) belongs
 in a hook, not here — the core stays a thin mapping onto git/shell.
+
+3. Command candidates — a shell command whose verdict is ASK (a
+   mutation under `mutation_gate: review`, or a command not on the
+   allowlist) cannot be diffed, but it IS reviewable: it stages as a
+   candidate of kind "command" in the same store, the human sees the
+   command, its declared `writes:` scope and the gate's reason, and
+   an accept executes it — sandboxed under a Seatbelt profile built
+   from that scope (sandbox.py), bare only on an explicit unsandboxed
+   accept. Hard blocks stay unreviewable denials; nothing here can
+   approve them.
 """
 
 from __future__ import annotations
@@ -33,6 +43,7 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from . import sandbox as sandbox_mod
 from .core import Decision, FileSpec, GateVerdict
 from .settings import Settings
 
@@ -213,6 +224,15 @@ def evaluate_policy(command: str, settings: Settings) -> GateVerdict:
                 "shell mutation denied by settings (mutation_gate=deny); "
                 "send file changes as ```file/```patch fences instead")
         if settings.mutation_gate == "review":
+            if settings.allowlist \
+                    and _glob_any(command, settings.allowlist):
+                # An explicit allowlist hit is the human's standing
+                # approval of this command shape — this is what makes
+                # a review's "always allow" persist: the pattern it
+                # saves lands here and approves outright. (The deny
+                # gate above and the hard blocks before it are NOT
+                # bypassed: flat denial and protected paths still win.)
+                return GateVerdict(Decision.ALLOW)
             return GateVerdict(
                 Decision.ASK,
                 "shell command mutates files — review gate required; "
@@ -629,9 +649,11 @@ def classify_and_stage(candidate_dir: Path, run_id: str,
     return candidate
 
 
-def load_candidate(candidate_dir: Path) -> Candidate:
+def load_candidate(candidate_dir: Path) -> "Candidate | CommandCandidate":
     manifest = json.loads(
         (candidate_dir / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("kind") == "command":
+        return load_command_candidate(candidate_dir, manifest)
     entries = [CandidateEntry(**e) for e in manifest["entries"]]
     return Candidate(candidate_id=manifest["candidate_id"],
                      run_id=manifest["run_id"],
@@ -640,12 +662,182 @@ def load_candidate(candidate_dir: Path) -> Candidate:
 
 
 # ---------------------------------------------------------------------------
+# Command candidates — a held shell command is reviewable too
+# ---------------------------------------------------------------------------
+#
+# A file payload stages as file entries; a shell command whose gate
+# verdict is ASK stages as a COMMAND candidate: a sibling record in
+# the same candidates store (manifest kind "command"), carrying no
+# file entries at all. The two kinds share the store, the decision
+# file (decision.json) and the review CLI, but neither distorts the
+# other — file candidates keep their entries model untouched, and a
+# command candidate is just the command, its context, its declared
+# write scope and the gate's reason. Accepting one EXECUTES the
+# command (sandboxed, unless the human explicitly accepts it bare);
+# there is nothing to "apply".
+
+
+def resolve_writes(declared: list[str], cwd: str | Path) -> list[str]:
+    """A payload's declared `writes:` entries as absolute paths:
+    relative entries resolve against the effective cwd. Resolved
+    (symlinks collapsed) and de-duplicated, order preserved — these
+    are the paths the sandbox profile and the review surface name."""
+    base = Path(cwd).expanduser()
+    resolved: list[str] = []
+    for entry in declared:
+        path = Path(entry).expanduser()
+        if not path.is_absolute():
+            path = base / path
+        text = str(path.resolve())
+        if text not in resolved:
+            resolved.append(text)
+    return resolved
+
+
+def derive_allow_pattern(command: str) -> str:
+    """The allowlist pattern an "always allow" review persists for
+    this command: the first token plus ` *` (a single-token command
+    persists as itself). The pattern is SHOWN in the review prompt —
+    the human approves the exact text that will stop future runs of
+    this shape from being held."""
+    tokens = command.strip().split()
+    if not tokens:
+        return ""
+    if len(tokens) == 1:
+        return tokens[0]
+    return f"{tokens[0]} *"
+
+
+@dataclass
+class CommandCandidate:
+    """A held shell command, staged for review (manifest kind
+    "command"). `writes` are the declared entries as written in the
+    payload; `resolved_writes` are the same paths resolved against
+    `cwd` — the sandbox scope. `files_section` preserves the result
+    section of a mixed payload whose files were already accepted, so
+    completing the command later still reports the whole run."""
+
+    candidate_id: str
+    run_id: str
+    session_id: str | None
+    dir: Path
+    command: str
+    cwd: str
+    timeout: float
+    writes: list[str] = field(default_factory=list)
+    resolved_writes: list[str] = field(default_factory=list)
+    reason: str = ""
+    clipboard_sha256: str = ""
+    files_section: str = ""
+
+    def pending(self) -> bool:
+        return not (self.dir / "decision.json").exists()
+
+    def summary(self) -> str:
+        shown = self.command if len(self.command) <= 72 \
+            else self.command[:69] + "…"
+        return f"candidate {self.candidate_id} — command: {shown}"
+
+    def presentation(self, shell_sandbox: str = "optional") -> str:
+        """The terminal review surface for a held command: the full
+        command, where it runs, why it was held, the write scope a
+        sandboxed accept confines it to, and the protected paths no
+        accept can make writable."""
+        lines = [f"candidate {self.candidate_id} — command review",
+                 f"  $ {self.command}",
+                 f"  cwd: {self.cwd}"]
+        if self.session_id:
+            lines.append(f"  session: {self.session_id}")
+        lines.append(f"  timeout: {self.timeout:g}s")
+        lines.append(f"  held: {self.reason}")
+        if self.writes:
+            lines.append("  declared write scope (sandboxed runs may "
+                         "also write the working directory + temp):")
+            for declared, resolved in zip(self.writes,
+                                          self.resolved_writes):
+                suffix = (f"  (declared: {declared})"
+                          if declared != resolved else "")
+                lines.append(f"    · {resolved}{suffix}")
+        else:
+            lines.append("  write scope: not declared — writes "
+                         "confined to the working directory + temp")
+        lines.append("  protected (never writable, even inside the "
+                     "scope):")
+        for path, _is_file in sandbox_mod.protected_carveouts(
+                Path(self.cwd)):
+            lines.append(f"    · {path}")
+        if shell_sandbox == "strict":
+            lines.append("  shell_sandbox=strict — unsandboxed "
+                         "execution is not offered")
+        return "\n".join(lines)
+
+
+def stage_command_candidate(candidate_dir: Path, run_id: str,
+                            session_id: str | None, *,
+                            command: str, cwd: str, timeout: float,
+                            writes: list[str], reason: str,
+                            clipboard_sha256: str,
+                            files_section: str = "") -> CommandCandidate:
+    """Stage a held shell command as a command candidate. Nothing
+    executes — staging only records the command and its context."""
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    candidate = CommandCandidate(
+        candidate_id=candidate_dir.name, run_id=run_id,
+        session_id=session_id, dir=candidate_dir, command=command,
+        cwd=cwd, timeout=timeout, writes=list(writes),
+        resolved_writes=resolve_writes(writes, cwd), reason=reason,
+        clipboard_sha256=clipboard_sha256, files_section=files_section)
+    manifest = {
+        "kind": "command",
+        "candidate_id": candidate.candidate_id, "run_id": run_id,
+        "session_id": session_id,
+        "command": command,
+        # Mirrored at top level: the runner's close/finish paths read
+        # these keys from any candidate manifest.
+        "shell_command": command, "cwd": cwd, "timeout": timeout,
+        "writes": candidate.writes,
+        "resolved_writes": candidate.resolved_writes,
+        "reason": reason, "clipboard_sha256": clipboard_sha256,
+        "files_section": files_section,
+    }
+    (candidate_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8")
+    return candidate
+
+
+def load_command_candidate(candidate_dir: Path,
+                           manifest: dict | None = None
+                           ) -> CommandCandidate:
+    if manifest is None:
+        manifest = json.loads(
+            (candidate_dir / "manifest.json").read_text(encoding="utf-8"))
+    return CommandCandidate(
+        candidate_id=manifest["candidate_id"],
+        run_id=manifest["run_id"],
+        session_id=manifest.get("session_id"),
+        dir=candidate_dir,
+        command=manifest.get("command") or "",
+        cwd=str(manifest.get("cwd", ".")),
+        timeout=float(manifest.get("timeout") or 0),
+        writes=list(manifest.get("writes") or []),
+        resolved_writes=list(manifest.get("resolved_writes") or []),
+        reason=str(manifest.get("reason") or ""),
+        clipboard_sha256=str(manifest.get("clipboard_sha256") or ""),
+        files_section=str(manifest.get("files_section") or ""))
+
+
+# ---------------------------------------------------------------------------
 # Decision data + apply
 # ---------------------------------------------------------------------------
 
 @dataclass
 class DecisionRecord:
-    decision: str                 # accept | accept-edited | reject
+    # File candidates: accept | accept-edited | reject.
+    # Command candidates: accept (= sandboxed) | accept-unsandboxed |
+    # always-allow (sandboxed + persist the allowlist pattern) |
+    # reject. One record type, one decision.json schema — the
+    # candidate's kind says which vocabulary applies.
+    decision: str
     reason: str = ""
     accepted_files: list[str] | None = None   # None = all entries
     decided_at: str = ""
@@ -658,7 +850,8 @@ class DecisionRecord:
         return entry.path in self.accepted_files
 
 
-def write_decision(candidate: Candidate, record: DecisionRecord) -> Path:
+def write_decision(candidate: "Candidate | CommandCandidate",
+                   record: DecisionRecord) -> Path:
     path = candidate.dir / "decision.json"
     path.write_text(json.dumps(asdict(record), indent=2), encoding="utf-8")
     return path

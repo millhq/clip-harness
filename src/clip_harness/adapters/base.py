@@ -19,8 +19,11 @@ class Clipboard(Protocol):
 class Decider(Protocol):
     """Captures the human's review decision as explicit data.
 
-    Returns None when no decision was made inside the window — the
-    run then stays PENDING with its candidate intact.
+    The candidate is a file Candidate or a CommandCandidate (a held
+    shell command) — the decision vocabulary differs by kind (see
+    gate.DecisionRecord). Returns None when no decision was made
+    inside the window — the run then stays PENDING with its
+    candidate intact.
     """
 
     def __call__(self, candidate: Candidate) -> DecisionRecord | None:

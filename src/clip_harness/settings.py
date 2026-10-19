@@ -17,6 +17,12 @@ Settings schema (all fields optional):
   "protected_paths": [".env", "*.key", "~/.ssh"],
   "hard_block_patterns": ["rm -rf /", ":(){ :|:& };:"],
   "mutation_gate": "review",         // review | allow | deny
+  "shell_sandbox": "optional",       // optional | strict — optional
+                                     // lets a reviewer accept a held
+                                     // shell command UNSANDBOXED;
+                                     // strict removes that option, so a
+                                     // reviewed command can only run
+                                     // under the Seatbelt sandbox
   "result_budget_chars": 100000,     // output chars per result block
                                      // before head+tail elision (the
                                      // full output is kept on disk)
@@ -76,6 +82,12 @@ class Settings:
     protected_paths: list[str] = field(default_factory=list)
     hard_block_patterns: list[str] = field(default_factory=list)
     mutation_gate: str = "review"  # review | allow | deny
+    # How a held shell command may be approved at review: "optional"
+    # (default) offers both sandboxed and unsandboxed accepts;
+    # "strict" removes the unsandboxed option entirely. Gate-relevant
+    # like mutation_gate — it changes what may run — so it IS part of
+    # the config hash.
+    shell_sandbox: str = "optional"  # optional | strict
     # Presentation only: how much command output a result block carries
     # before head+tail elision (the full output is always preserved in
     # the run's output file). Sized for the receiving surface — the
@@ -107,6 +119,7 @@ class Settings:
                 "protected_paths": self.protected_paths,
                 "hard_block_patterns": self.hard_block_patterns,
                 "mutation_gate": self.mutation_gate,
+                "shell_sandbox": self.shell_sandbox,
                 "hooks": {
                     event: [
                         {"matcher": h.matcher, "command": h.command,
@@ -153,6 +166,10 @@ def _merge(base: Settings, data: dict, source: str) -> None:
         base.timeout = float(data["timeout"])
     if "mutation_gate" in data:
         base.mutation_gate = str(data["mutation_gate"])
+    shell_sandbox = data.get("shell_sandbox")
+    if isinstance(shell_sandbox, str) \
+            and shell_sandbox.lower() in ("optional", "strict"):
+        base.shell_sandbox = shell_sandbox.lower()
     budget = _positive_int(data.get("result_budget_chars"))
     if budget is not None:
         base.result_budget_chars = budget
@@ -195,3 +212,25 @@ def load_settings(cwd: str | Path | None = None,
     if data is not None:
         _merge(settings, data, str(project_file))
     return settings
+
+
+def add_project_allowlist_pattern(cwd: str | Path, pattern: str) -> bool:
+    """Persist an allowlist pattern into the PROJECT settings file
+    (`.clip-harness/settings.json` under `cwd`) — the write behind a
+    review's "always allow this command". Other keys are preserved;
+    the pattern is appended to the file's own `allowlist` list (the
+    merged settings concatenate scopes, so the project file's list is
+    where a project-scoped approval belongs). Returns True when the
+    file changed (False when the pattern was already there)."""
+    path = Path(cwd) / PROJECT_SETTINGS
+    data = _load_json(path) or {}
+    allowlist = data.get("allowlist")
+    if not isinstance(allowlist, list):
+        allowlist = []
+    if pattern in allowlist:
+        return False
+    allowlist.append(pattern)
+    data["allowlist"] = allowlist
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return True

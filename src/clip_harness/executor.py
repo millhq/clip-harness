@@ -14,12 +14,21 @@ the file keeps accumulating exactly the bytes the plain path would
 capture. Silence past ``HEARTBEAT_INTERVAL_S`` emits a short elapsed
 note to the sink only. The sink is presentation — like diff color, it
 never touches the captured output, the spill file, or the result.
+
+Sandboxing is the same shape of layer: when a ``sandbox_profile`` is
+supplied (a reviewed command accepted SANDBOXED), the spawn argv is
+prefixed with `sandbox-exec -p <profile>` — supervision, timeout and
+cancel are unchanged, and the streamed path composes identically.
+If sandbox-exec is not available the run FAILS CLOSED: nothing
+executes and the result says why. A sandboxed command never runs
+bare by accident.
 """
 
 from __future__ import annotations
 
 import codecs
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -39,7 +48,8 @@ class Executor(Protocol):
     def run(self, command: str, cwd: str | Path, timeout: float,
             cancel_event: threading.Event, output_path: Path,
             sink: Callable[[str], None] | None = None,
-            heartbeat_interval: float | None = None) -> ExecResult:
+            heartbeat_interval: float | None = None,
+            sandbox_profile: str | None = None) -> ExecResult:
         ...
 
 
@@ -74,21 +84,46 @@ class LocalExecutor:
     def __init__(self, shell: str = "/bin/sh"):
         self.shell = shell
 
+    def _spawn_argv(self, command: str,
+                    sandbox_profile: str | None) -> list[str]:
+        """The process argv for one run: the shell invocation, with
+        the Seatbelt wrapper as a prefix when the run is sandboxed."""
+        argv = [self.shell, "-c", command]
+        if sandbox_profile is not None:
+            argv = ["sandbox-exec", "-p", sandbox_profile, *argv]
+        return argv
+
     def run(self, command: str, cwd: str | Path, timeout: float,
             cancel_event: threading.Event, output_path: Path,
             sink: Callable[[str], None] | None = None,
-            heartbeat_interval: float | None = None) -> ExecResult:
+            heartbeat_interval: float | None = None,
+            sandbox_profile: str | None = None) -> ExecResult:
         cwd = Path(cwd)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        if sandbox_profile is not None \
+                and shutil.which("sandbox-exec") is None:
+            # Fail closed: a sandboxed accept must never degrade
+            # into a bare run. Nothing executes; the result block
+            # carries the reason (and the human's recourse is an
+            # explicit unsandboxed accept at a fresh review).
+            message = ("sandboxed execution unavailable: sandbox-exec "
+                       "not found on this machine — the command was "
+                       "NOT run. Re-review and accept it unsandboxed "
+                       "explicitly if it should run bare.")
+            output_path.write_text(message + "\n", encoding="utf-8")
+            return ExecResult(output=message + "\n",
+                              exit_desc="error: sandbox-exec unavailable",
+                              exit_code=None, elapsed=0.0,
+                              output_file=str(output_path))
         if sink is not None:
             return self._run_streamed(command, cwd, timeout,
                                       cancel_event, output_path, sink,
-                                      heartbeat_interval)
+                                      heartbeat_interval, sandbox_profile)
         started = time.monotonic()
         cancelled = timed_out = False
         with open(output_path, "wb") as out:
             proc = subprocess.Popen(
-                [self.shell, "-c", command],
+                self._spawn_argv(command, sandbox_profile),
                 cwd=str(cwd), stdout=out, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, start_new_session=True)
             while proc.poll() is None:
@@ -108,7 +143,8 @@ class LocalExecutor:
     def _run_streamed(self, command: str, cwd: Path, timeout: float,
                       cancel_event: threading.Event, output_path: Path,
                       sink: Callable[[str], None],
-                      heartbeat_interval: float | None) -> ExecResult:
+                      heartbeat_interval: float | None,
+                      sandbox_profile: str | None = None) -> ExecResult:
         """The capture path with a live terminal view: the child's
         merged stdout/stderr flows through a pipe; a pump thread
         writes each chunk to the spill file (flushed, so tail -f
@@ -123,7 +159,7 @@ class LocalExecutor:
         state = _StreamState()
         with open(output_path, "wb") as out:
             proc = subprocess.Popen(
-                [self.shell, "-c", command],
+                self._spawn_argv(command, sandbox_profile),
                 cwd=str(cwd), stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                 start_new_session=True)

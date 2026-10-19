@@ -10,6 +10,12 @@ One pass through process_text():
         │     ├─ no decision ─► PENDING (candidate intact)
         │     ├─ reject ─► denial path (no post hooks)
         │     └─ accept ─► apply (verify + rollback) ─► shell, if any
+        ├─ ask verdict on a shell command ─► command review branch
+        │     stage a kind-"command" candidate ─► decision data
+        │     ├─ no decision ─► PENDING (command candidate intact)
+        │     ├─ reject ─► denial path (no post hooks)
+        │     └─ accept ─► execute (sandboxed, or bare only on an
+        │           explicit unsandboxed accept)
         └─ allow ─► execute ─► PostRun / PostRunFailure (separate
               events; receipt BEFORE clipboard overwrite)
               ─► RunClosed (refuses a clean close while pending)
@@ -37,6 +43,7 @@ from typing import Callable
 
 from . import gate as gate_mod
 from . import hooks as hooks_mod
+from . import sandbox as sandbox_mod
 from .core import (MAX_PAYLOAD_CHARS, Decision, Event, GateVerdict, Payload,
                    RunContext, RunState, cap_output, elide_output,
                    format_result, new_run_id, now_iso, sha256_text)
@@ -46,7 +53,7 @@ from .manifest import ManifestStore
 from .payload import PayloadError, parse_clipboard_text
 from .receipts import Ledger, Transcript
 from .sessions import RunHandle, SessionRegistry
-from .settings import Settings
+from .settings import Settings, add_project_allowlist_pattern, load_settings
 
 ACTION_OPS = {"goal-set", "goal-status", "task-add",
               "task-doing", "task-done", "task-open"}
@@ -63,6 +70,7 @@ class RunOutcome:
 
 class LifecycleRunner:
     def __init__(self, *, settings: Settings, clipboard=None, decider=None,
+                 command_decider=None,
                  diff_opener=None, inline_review: bool = False,
                  stream_output: bool = False,
                  stream_sink: Callable[[str], None] | None = None,
@@ -75,6 +83,12 @@ class LifecycleRunner:
         self.state_dir = Path(settings.state_dir).expanduser()
         self.clipboard = clipboard
         self.decider = decider
+        # The decision channel for held shell COMMANDS (command
+        # candidates). Falls back to `decider` when not wired
+        # separately — most channels (file-drop, scripted) serve both
+        # candidate kinds; the terminal channel dispatches per kind
+        # (see cli.py).
+        self.command_decider = command_decider
         # Stored for embedders; the runner itself never opens diffs —
         # the terminal decider owns the VS Code option (see cli.py).
         self.diff_opener = diff_opener
@@ -246,24 +260,16 @@ class LifecycleRunner:
             if isinstance(result, RunOutcome):
                 return result
             files_section = result
-        elif verdict.decision == Decision.ASK:
-            # A bare shell mutation (or a non-allowlisted command) with
-            # no file fences cannot be diffed — park it pending with
-            # the reason recorded; never run it silently.
-            self.registry.set_state(handle, RunState.PENDING_REVIEW.value)
-            self.ledger.append(run_id, Event.REVIEW_DECISION.value,
-                               {"status": "pending",
-                                "reason": verdict.reason},
-                               session_id=self.session_id,
-                               binding_id=payload.session_id)
-            self._dispatch_review(ctx, "pending", None, None)
-            note = (f"⏳ clip-harness: held for review — {verdict.reason}\n"
-                    f"Re-send mutations as ```file / ```patch fences so "
-                    f"they can be reviewed as a diff.")
-            self._set_clipboard(note)
-            return RunOutcome(run_id, RunState.PENDING_REVIEW,
-                              f"held pending review: {verdict.reason}",
-                              result_block=note)
+        if verdict.decision == Decision.ASK and command.strip():
+            # A shell command the gate held (a mutation under
+            # mutation_gate: review, or not on the allowlist) — with
+            # or without file fences. It cannot be diffed, but it IS
+            # reviewable: the command review branch stages it as a
+            # command candidate and a decision executes it
+            # (sandboxed by default) or parks it for one.
+            return self._shell_review_branch(
+                ctx, handle, payload, verdict, command, effective_cwd,
+                timeout, files_section)
 
         if not command.strip():
             return self._complete_files_only(ctx, handle, files_section)
@@ -476,11 +482,215 @@ class LifecycleRunner:
                 files_section=report.section())
         return report.section()
 
+    # ------------------------------------------------------------------
+    # Command review branch — a held shell command is reviewable
+    # ------------------------------------------------------------------
+
+    def _shell_review_branch(self, ctx: RunContext, handle: RunHandle,
+                             payload: Payload, verdict: GateVerdict,
+                             command: str, cwd: str, timeout: float,
+                             files_section: str) -> RunOutcome:
+        """Stage an ASK-verdict shell command as a command candidate
+        and take a decision when a channel exists (an attended
+        payload, or an entry point wired for inline review). No
+        decision parks the run with the candidate intact — the
+        clipboard note names the review command. For a mixed payload
+        the files are already accepted at this point (files_section
+        is preserved on the candidate); the command alone waits."""
+        run_id = ctx.run_id
+        candidate_dir = self.state_dir / "candidates" / run_id
+        try:
+            candidate = gate_mod.stage_command_candidate(
+                candidate_dir, run_id, payload.session_id,
+                command=command, cwd=cwd, timeout=timeout,
+                writes=payload.writes, reason=verdict.reason,
+                clipboard_sha256=ctx.clipboard_sha256,
+                files_section=files_section)
+        except gate_mod.GateError as exc:
+            return self._fail(ctx, handle,
+                              f"candidate staging failed: {exc}",
+                              extra={"stage": "candidate"})
+        ctx.candidate_id = run_id
+        self.ledger.append(run_id, Event.REVIEW_DECISION.value,
+                           {"status": "staged", "kind": "command",
+                            "candidate_id": run_id, "command": command,
+                            "writes": candidate.resolved_writes,
+                            "reason": verdict.reason},
+                           session_id=self.session_id,
+                           binding_id=payload.session_id)
+        self._dispatch_review(ctx, "staged", run_id, None)
+        record = None
+        if payload.attend or self.inline_review:
+            self.presenter(candidate.presentation(
+                self.settings.shell_sandbox))
+            decider = self.command_decider or self.decider
+            if decider is not None:
+                record = decider(candidate)
+        if record is None:
+            self.registry.set_state(handle, RunState.PENDING_REVIEW.value)
+            self.ledger.append(run_id, Event.REVIEW_DECISION.value,
+                               {"status": "pending", "kind": "command",
+                                "candidate_id": run_id},
+                               session_id=self.session_id,
+                               binding_id=payload.session_id)
+            self._dispatch_review(ctx, "pending", run_id, None)
+            note = (f"⏳ clip-harness: command candidate {run_id} held "
+                    f"for review — {verdict.reason}\n"
+                    f"Review it with: "
+                    f"clip-harness candidate review {run_id}")
+            self._set_clipboard(note)
+            return RunOutcome(run_id, RunState.PENDING_REVIEW,
+                              f"held pending review: {verdict.reason}",
+                              result_block=note, candidate_id=run_id)
+        return self._apply_command_decision(ctx, handle, candidate,
+                                            record, files_section)
+
+    def _apply_command_decision(self, ctx: RunContext, handle: RunHandle,
+                                candidate: gate_mod.CommandCandidate,
+                                record: gate_mod.DecisionRecord,
+                                files_section: str = "") -> RunOutcome:
+        """Carry out one command-candidate decision: reject denies
+        the run (reason back to the model, no post hooks — the file
+        flow's reject shape); an accept EXECUTES the command, under
+        the Seatbelt sandbox built from its declared scope unless the
+        human explicitly accepted it unsandboxed. "always-allow"
+        additionally persists the derived allowlist pattern to the
+        project settings so this command shape is not held again."""
+        run_id = ctx.run_id
+        decision = record.decision
+        if decision not in ("accept", "accept-unsandboxed",
+                            "always-allow", "reject"):
+            return self._fail(
+                ctx, handle,
+                f"unknown decision for a command candidate: "
+                f"{decision!r} (expected accept, accept-unsandboxed, "
+                f"always-allow or reject)",
+                extra={"stage": "review", "kind": "command"})
+        mode = {"accept": "sandboxed",
+                "always-allow": "sandboxed",
+                "accept-unsandboxed": "unsandboxed"}.get(decision)
+        if decision == "accept-unsandboxed" \
+                and self.settings.shell_sandbox == "strict":
+            return self._fail(
+                ctx, handle,
+                "unsandboxed execution refused: shell_sandbox is set "
+                "to strict — a reviewed command may only run "
+                "sandboxed",
+                extra={"stage": "review", "kind": "command"})
+        gate_mod.write_decision(candidate, record)
+        decision_data = {"decision": decision, "reason": record.reason,
+                         "mode": mode, "command": candidate.command,
+                         "writes": candidate.resolved_writes}
+        pattern = None
+        if decision == "always-allow":
+            pattern = gate_mod.derive_allow_pattern(candidate.command)
+            decision_data["always_pattern"] = pattern
+        self._dispatch_review(ctx, decision, run_id, decision_data)
+        if decision == "reject":
+            # Rejection: receipt + rejection text, NO post hooks fire.
+            self.ledger.append(run_id, Event.REVIEW_DECISION.value,
+                               {"status": "rejected", "kind": "command",
+                                "reason": record.reason,
+                                "decision": decision,
+                                "command": candidate.command,
+                                "writes": candidate.resolved_writes,
+                                "mode": None},
+                               session_id=self.session_id,
+                               binding_id=ctx.binding_id)
+            text = ("✗ clip-harness: command rejected"
+                    + (f" — {record.reason}" if record.reason else "")
+                    + f"\n  ✗ $ {candidate.command} — rejected")
+            self._set_clipboard(text)
+            if self.transcript:
+                self.transcript.append_run(now_iso(), candidate.command,
+                                           text, "rejected", 0.0)
+            self.registry.set_state(handle, RunState.REJECTED.value)
+            self._close(ctx, handle)
+            return RunOutcome(run_id, RunState.REJECTED,
+                              f"rejected: {record.reason}".strip(),
+                              result_block=text)
+        if pattern and add_project_allowlist_pattern(candidate.cwd,
+                                                      pattern):
+            self._note_config_change(candidate.cwd, pattern)
+        profile = None
+        if mode == "sandboxed":
+            profile = sandbox_mod.build_profile(
+                cwd=candidate.cwd,
+                writes=[Path(p) for p in candidate.resolved_writes])
+        self.ledger.append(run_id, Event.REVIEW_DECISION.value,
+                           {"status": "approved", "kind": "command",
+                            "candidate_id": run_id, "decision": decision,
+                            "mode": mode, "command": candidate.command,
+                            "writes": candidate.resolved_writes,
+                            "reason": record.reason,
+                            **({"always_pattern": pattern}
+                               if pattern else {})},
+                           session_id=self.session_id,
+                           binding_id=ctx.binding_id)
+        note = f"reviewed · {mode}"
+        return self._execute(ctx, handle, candidate.command,
+                             candidate.cwd, candidate.timeout,
+                             files_section, sandbox_profile=profile,
+                             command_note=note)
+
+    def _note_config_change(self, cwd: str, pattern: str) -> None:
+        """An always-allow decision rewrote the project settings:
+        record it exactly the way arm() records a settings edit made
+        while armed — ConfigChange ledger entry + hook dispatch, and
+        the stored config hash moves to the new value so the change
+        is reported once, here, not again at the next arm."""
+        fresh = load_settings(cwd)
+        current = fresh.config_hash()
+        hash_path = self.state_dir / "config.hash"
+        previous = (hash_path.read_text(encoding="utf-8").strip()
+                    if hash_path.exists() else None)
+        if previous == current:
+            return
+        self.ledger.append("session", Event.CONFIG_CHANGE.value,
+                           {"status": "changed", "from": previous,
+                            "to": current, "reason": "always-allow",
+                            "pattern": pattern},
+                           session_id=self.session_id)
+        self._dispatch_simple(Event.CONFIG_CHANGE, cwd)
+        hash_path.write_text(current, encoding="utf-8")
+
+    def _review_command_candidate(self, candidate_id: str,
+                                  candidate: gate_mod.CommandCandidate,
+                                  decider) -> RunOutcome:
+        """Finish a parked command candidate out-of-band (the CLI
+        review path): the decider sees the command candidate, and an
+        accept executes the command through _execute — PostRun
+        hooks, the bound footer and the reviewed-run note included."""
+        record = decider(candidate)
+        if record is None:
+            return RunOutcome(candidate_id, RunState.PENDING_REVIEW,
+                              "still pending — no decision captured",
+                              candidate_id=candidate_id)
+        payload = Payload(command=candidate.command,
+                          session_id=candidate.session_id,
+                          writes=candidate.writes)
+        ctx = RunContext(run_id=candidate_id, payload=payload,
+                         cwd=candidate.cwd, session_id=self.session_id)
+        ctx.clipboard_sha256 = candidate.clipboard_sha256
+        ctx.candidate_id = candidate_id
+        ctx.command_executed = candidate.command
+        handle = RunHandle(
+            run_id=candidate_id, command=candidate.command,
+            cwd=candidate.cwd, binding_id=candidate.session_id,
+            output_file=str(self.state_dir / "runs" / candidate_id
+                            / "output.txt"))
+        self.registry.register(handle)
+        return self._apply_command_decision(
+            ctx, handle, candidate, record, candidate.files_section)
+
     def review_candidate(self, candidate_id: str,
                          decider) -> RunOutcome:
         """Finish a pending candidate out-of-band (the CLI review path)."""
         candidate_dir = self.state_dir / "candidates" / candidate_id
         candidate = gate_mod.load_candidate(candidate_dir)
+        if isinstance(candidate, gate_mod.CommandCandidate):
+            return self._review_command_candidate(candidate_id, candidate,
+                                                  decider)
         manifest = json.loads(
             (candidate_dir / "manifest.json").read_text(encoding="utf-8"))
         record = decider(candidate)
@@ -603,7 +813,9 @@ class LifecycleRunner:
 
     def _execute(self, ctx: RunContext, handle: RunHandle, command: str,
                  cwd: str, timeout: float,
-                 files_section: str) -> RunOutcome:
+                 files_section: str,
+                 sandbox_profile: str | None = None,
+                 command_note: str = "") -> RunOutcome:
         run_id = ctx.run_id
         self.registry.set_state(handle, RunState.RUNNING.value)
         stop = threading.Event()
@@ -617,6 +829,11 @@ class LifecycleRunner:
                         break
             threading.Thread(target=_watch_flag, daemon=True).start()
         run_kwargs: dict = {}
+        if sandbox_profile is not None:
+            # A reviewed command accepted sandboxed: the executor
+            # wraps the spawn in sandbox-exec (and fails closed if
+            # it cannot). Composes with streaming like any other run.
+            run_kwargs["sandbox_profile"] = sandbox_profile
         if self.stream_output:
             self.presenter(self._run_header(command, cwd, timeout,
                                             handle.binding_id))
@@ -678,6 +895,7 @@ class LifecycleRunner:
                               standing_section=self._standing(ctx),
                               extra_section=self._extra_section(
                                   ctx, outcome),
+                              command_note=command_note,
                               budget=self.settings.result_budget_chars)
         self._save_result(run_id, block)
         if self.transcript:
@@ -967,7 +1185,9 @@ class LifecycleRunner:
         path = self.state_dir / "runs" / run_id / "result.txt"
         return path.read_text(encoding="utf-8") if path.exists() else None
 
-    def pending_candidates(self) -> list[gate_mod.Candidate]:
+    def pending_candidates(self) -> list:
+        """All undecided candidates (file and command kinds), oldest
+        first — the `candidate list` surface."""
         root = self.state_dir / "candidates"
         found = []
         if root.exists():

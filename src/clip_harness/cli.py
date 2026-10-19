@@ -26,8 +26,8 @@ from pathlib import Path
 from . import __version__
 from .contract import validate_hook_input
 from .core import Event
-from .gate import DecisionRecord, load_candidate, read_decision, \
-    write_decision
+from .gate import CommandCandidate, DecisionRecord, load_candidate, \
+    read_decision, write_decision
 from .goals import GoalStore
 from .hooks import dispatch
 from .payload import Payload
@@ -64,12 +64,28 @@ def _default_decider(settings=None, diff_opener=None):
     Headless, the file-drop decider may poll generously: drop a
     decision.json into the candidate directory to decide the run.
     The wait is bounded by CLIP_HARNESS_ATTEND_WAIT_S (default
-    600s); no decision inside the window means the run parks."""
-    from .adapters.headless import FileDropDecider, TerminalDecider
+    600s); no decision inside the window means the run parks.
+
+    One channel serves both candidate kinds: file candidates get the
+    file prompt, command candidates the command prompt (sandboxed /
+    unsandboxed / always-allow / reject); the file-drop decider is
+    kind-agnostic — it just reads the candidate's decision.json."""
+    from .adapters.headless import (FileDropDecider, TerminalCommandDecider,
+                                    TerminalDecider)
     if sys.stdin.isatty():
-        return TerminalDecider(
-            out=printer(settings.color if settings else "auto"),
-            diff_opener=diff_opener)
+        out = printer(settings.color if settings else "auto")
+        terminal = TerminalDecider(out=out, diff_opener=diff_opener)
+        command_terminal = TerminalCommandDecider(
+            out=out,
+            shell_sandbox=(settings.shell_sandbox if settings
+                           else "optional"))
+
+        def decide(candidate):
+            if isinstance(candidate, CommandCandidate):
+                return command_terminal(candidate)
+            return terminal(candidate)
+
+        return decide
     wait = float(os.environ.get("CLIP_HARNESS_ATTEND_WAIT_S", "600"))
     return FileDropDecider(timeout_s=wait)
 
@@ -302,13 +318,31 @@ def cmd_candidate(args) -> int:
         print(f"clip-harness: no candidate {args.id!r}", file=sys.stderr)
         return 1
     candidate = load_candidate(candidate_dir)
+    is_command = isinstance(candidate, CommandCandidate)
     if args.candidate_cmd == "show":
-        print(paint(candidate.presentation(), settings.color))
+        if is_command:
+            print(paint(candidate.presentation(settings.shell_sandbox),
+                        settings.color))
+        else:
+            print(paint(candidate.presentation(), settings.color))
         return 0
+    decision_arg = getattr(args, "decision", None)
+    if decision_arg and is_command and decision_arg == "accept-edited":
+        print("clip-harness: accept-edited does not apply to a command "
+              "candidate — use accept, accept-unsandboxed or reject",
+              file=sys.stderr)
+        return 1
+    if decision_arg and not is_command \
+            and decision_arg == "accept-unsandboxed":
+        print("clip-harness: accept-unsandboxed applies only to "
+              "command candidates — use accept, accept-edited or reject",
+              file=sys.stderr)
+        return 1
     if args.candidate_cmd == "decide":
         if not args.decision:
             print("clip-harness: decide needs --decision "
-                  "accept|accept-edited|reject", file=sys.stderr)
+                  "accept|accept-edited|accept-unsandboxed|reject",
+                  file=sys.stderr)
             return 1
         record = DecisionRecord(
             decision=args.decision, reason=args.reason or "",
@@ -335,15 +369,22 @@ def cmd_candidate(args) -> int:
                                 if args.files else None))
             decider = _static_decider(record)
         elif sys.stdin.isatty():
-            # Terminal review: VS Code is an option inside the
-            # prompt (owned by the decider), never opened upfront.
-            from .adapters.headless import TerminalDecider
-            decider = TerminalDecider(out=printer(settings.color),
-                                      diff_opener=runner.diff_opener)
+            # Terminal review: VS Code is an option inside the file
+            # prompt (owned by the decider), never opened upfront;
+            # command candidates get the command prompt.
+            if is_command:
+                from .adapters.headless import TerminalCommandDecider
+                decider = TerminalCommandDecider(
+                    out=printer(settings.color),
+                    shell_sandbox=settings.shell_sandbox)
+            else:
+                from .adapters.headless import TerminalDecider
+                decider = TerminalDecider(out=printer(settings.color),
+                                          diff_opener=runner.diff_opener)
         else:
             print("clip-harness: review needs a decision — pass "
-                  "--decision accept|accept-edited|reject (or run in a "
-                  "terminal)", file=sys.stderr)
+                  "--decision accept|accept-edited|accept-unsandboxed|"
+                  "reject (or run in a terminal)", file=sys.stderr)
             return 1
         outcome = runner.review_candidate(args.id, decider)
     if outcome.result_block:
@@ -495,7 +536,8 @@ def build_parser() -> argparse.ArgumentParser:
         c = csub.add_parser(name)
         c.add_argument("id")
         c.add_argument("--decision",
-                       choices=("accept", "accept-edited", "reject"))
+                       choices=("accept", "accept-edited",
+                                "accept-unsandboxed", "reject"))
         c.add_argument("--reason", default="")
         c.add_argument("--files",
                        help="comma-separated paths to accept "

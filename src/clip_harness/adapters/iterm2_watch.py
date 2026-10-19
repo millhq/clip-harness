@@ -58,11 +58,27 @@ class ITerm2TabExecutor:
     def run(self, command: str, cwd, timeout: float,
             cancel_event: threading.Event,
             output_path: Path, sink=None,
-            heartbeat_interval: float | None = None) -> ExecResult:
+            heartbeat_interval: float | None = None,
+            sandbox_profile: str | None = None) -> ExecResult:
         # sink / heartbeat_interval are accepted for interface parity
         # with LocalExecutor and ignored: the command runs visibly in
         # its own iTerm2 tab (that IS the live view), and the watch
         # wiring never enables streaming anyway.
+        if sandbox_profile is not None:
+            # Fail closed: a command accepted SANDBOXED must never
+            # run bare in the tab — this backend cannot wrap the tab's
+            # shell in sandbox-exec. Nothing executes.
+            message = ("sandboxed execution is not supported by the "
+                       "iTerm2 backend — the command was NOT run. "
+                       "Review it from a terminal (candidate review) "
+                       "or accept it unsandboxed explicitly.")
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_text(message + "\n", encoding="utf-8")
+            return ExecResult(
+                output=message + "\n",
+                exit_desc="error: sandbox unavailable in this backend",
+                exit_code=None, elapsed=0.0,
+                output_file=str(output_path))
         future = asyncio.run_coroutine_threadsafe(
             self._run_in_tab(command, str(cwd), timeout, cancel_event,
                              Path(output_path)),

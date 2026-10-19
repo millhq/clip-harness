@@ -156,6 +156,11 @@ text. Recognised keys:
 - `timeout:` — per-command timeout in seconds.
 - `attend:` — `true` opts this run into attended mode (below);
   anything else, or absent, is async.
+- `writes:` — comma-separated paths the command declares it may
+  write (relative entries resolve against the effective cwd). The
+  declaration scopes the sandbox when the command is held for
+  review (see *Reviewed shell commands* below); an empty value is
+  malformed and fails closed.
 
 (```run is accepted as a legacy alias for ```shell.)
 
@@ -239,7 +244,8 @@ blocked waiting on output.
   review` / `decide` / `apply`, or a `decision.json` drop); only
   then do apply, receipt, clipboard, and the completion
   notification happen. For a parked review, rejecting *is* the
-  steering.
+  steering. A held shell command parks the same way, as a command
+  candidate (see *Reviewed shell commands* below).
 - **Attended (`attend: true`).** The payload itself demands the
   inline wait in any context that has a decision window — e.g.
   the iTerm2 watch's `decision.json` drop — for the runs where the
@@ -467,7 +473,81 @@ Built-in policy runs before hooks: hard-block patterns are evaluated
 **before** the allowlist (exit-2 semantics); a denylist match denies;
 a non-empty allowlist that doesn't match asks; shell commands that
 look like mutations ask under `mutation_gate: "review"` (the default)
-so file changes travel as reviewable fences instead.
+so file changes can travel as reviewable fences instead. An explicit
+allowlist **hit** is the human's standing approval: it approves the
+command outright (this is what a review's *always allow* persists —
+below). A mutation the gate holds is not a dead end, though: the
+command itself is reviewable, as the next section describes.
+
+### Reviewed shell commands
+
+Some commands cannot be predeclared as file fences — a supplier
+script that *generates* its outputs, a build, a code generator.
+When the gate's verdict on a shell command is **ask** (a mutation
+under `mutation_gate: "review"`, or a command not on the allowlist),
+the run pauses for a decision instead of executing, wherever the
+command appears: bare, or as the shell part of a mixed payload
+(after its files are accepted). The command is staged as a
+**command candidate** in the same candidates store as file
+candidates (manifest kind `"command"`: the command, cwd, timeout,
+session, declared `writes:`, the gate's reason, and the clipboard
+hash) and the review surface shows:
+
+- the full command, its cwd, session (when bound) and timeout;
+- the gate's reason for holding it;
+- the declared write scope — or, with no `writes:` header, that
+  writes are confined to the working directory + temp;
+- the protected carve-outs (below) that no accept can override.
+
+Decisions, at the terminal prompt or as recorded decision data:
+
+- **accept** — execute under the sandbox (the default accept);
+- **accept unsandboxed** — execute bare. Offered only when the
+  `shell_sandbox` setting is `"optional"` (the default);
+  `"strict"` removes it entirely, from the prompt and from recorded
+  decisions alike;
+- **always allow** — accept sandboxed AND persist an allowlist
+  pattern derived from the command (first token + ` *`, shown in
+  the prompt, e.g. `suppliers/openapi/discover *`) into the
+  **project** settings (`.clip-harness/settings.json` under the
+  cwd, other keys preserved; a ConfigChange is recorded), so future
+  runs of that shape evaluate ALLOW and are not held;
+- **reject** (+reason) — nothing runs; the denial result carries
+  the reason back to the model;
+- **later** — no decision: the run parks in `pending_review` as a
+  command candidate, exactly like a file candidate. The clipboard
+  note names the mechanism: `clip-harness candidate review <id>`.
+  `candidate list` / `show` present it as a command with its scope
+  and reason; `candidate review` offers the same decisions and
+  executes an accepted command through the runner (PostRun hooks,
+  bound footer, result block); `candidate review --decision`
+  accepts `accept` (= sandboxed), `accept-unsandboxed` and
+  `reject` for command candidates. `candidate decide` records a
+  decision for a later `candidate apply`, as with files — one
+  difference: for a command candidate, *apply* means **execute the
+  approved command** (there are no files to write).
+
+**The sandbox (macOS Seatbelt).** A sandboxed execution is wrapped
+in `sandbox-exec -p <profile>` at process spawn; supervision,
+timeout and cancel are unchanged. The profile is a pure function of
+(cwd, declared writes, temp dirs, config dirs): reads are broadly
+allowed; file writes are denied by default, then allowed for the
+effective cwd, each declared `writes:` path, and the temp dirs;
+hard write-denies that no allow overrides sit inside those roots —
+`<cwd>/.git/hooks`, `<cwd>/.git/config`, the user's clip-harness
+config dir, and `<cwd>/.clip-harness`. Process exec/fork is
+allowed. Non-goals in this slice: **network is unrestricted** (no
+network rules are emitted), and the sandbox is **macOS Seatbelt
+only** — where `sandbox-exec` is unavailable, a sandboxed accept
+**fails closed** with a clear result-block error and nothing runs;
+the human's recourse is an explicit unsandboxed accept.
+
+The result block of a reviewed run records the approval on the
+command line — `$ make evidence (reviewed · sandboxed)` — the one
+annotation a reviewed run adds. Hard blocks (destructive patterns,
+protected-path mutations, the denylist) stay unreviewable denials,
+and `mutation_gate: "deny"` stays a flat denial: neither can be
+approved at review.
 
 ### Settings
 
@@ -484,6 +564,7 @@ project. See [examples/settings.example.json](examples/settings.example.json).
   "protected_paths": [".env", "~/.ssh"],
   "hard_block_patterns": ["rm\\s+-rf\\s+/"],
   "mutation_gate": "review",
+  "shell_sandbox": "optional",
   "result_budget_chars": 100000,
   "color": "auto",
   "hooks": {
@@ -539,6 +620,11 @@ lifecycle this way.
   failure.
 - Decisions are **explicit data**, never inferred from silence. No
   decision = pending, forever, until a human decides.
+- A held shell command executes only on a recorded decision, and a
+  sandboxed accept **fails closed** when the sandbox cannot be
+  built or `sandbox-exec` is unavailable — it never degrades into
+  a bare run. Unsandboxed execution requires its own explicit
+  decision, and `shell_sandbox: "strict"` removes even that.
 - The **receipt is written before the clipboard is overwritten**, so
   the evidence trail never lags reality; every run's payload is
   hashed into the ledger at capture time.

@@ -14,10 +14,13 @@ A copied message is ONE payload made of fences:
     ```
         Commands to run. The leading `key: value` lines are the metadata
         header; recognised keys are session, action, cwd, timeout,
-        attend. The
+        attend, writes. The
         rest of the fence is shell text. `session:` binds the run to that
         session id (addressable for cancel/rerun, receipt keyed by it);
-        without it the run is unbound but still runs.
+        without it the run is unbound but still runs. `writes:` is a
+        comma-separated declaration of the paths the command may write
+        — it scopes the sandbox when the command is held for review;
+        an empty value is malformed (fail closed).
 
     ```file
     path: src/auth.py
@@ -78,7 +81,7 @@ _FENCE_OPEN = re.compile(
 _FENCE_OPEN_COUNT = re.compile(
     r"^```(shell|run|file|patch)\b", re.MULTILINE)
 _HEADER_LINE = re.compile(
-    r"^(session|action|cwd|timeout|attend)\s*:\s*(.*?)\s*$",
+    r"^(session|action|cwd|timeout|attend|writes)\s*:\s*(.*?)\s*$",
     re.IGNORECASE)
 _PATH_LINE = re.compile(r"^path\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _OP_LINE = re.compile(r"^op\s*:\s*(create|update|delete|auto)\s*$", re.IGNORECASE)
@@ -169,6 +172,19 @@ def _parse_shell_body(body: str, fence_attrs: dict[str, str]) -> Payload:
     if header.get("attend"):
         payload.attend = header["attend"].strip().lower() in (
             "true", "yes", "1")
+    if "writes" in header:
+        # `writes:` declares the paths the command may write — the
+        # scope a reviewed (sandboxed) run is confined to. An empty
+        # value is malformed metadata, not "no declaration": fail
+        # closed, exactly like a bad timeout.
+        entries = [part.strip() for part in header["writes"].split(",")]
+        entries = [entry for entry in entries if entry]
+        if not entries:
+            raise PayloadError(
+                "empty 'writes:' in payload header — declare the "
+                "paths the command may write, comma-separated, or "
+                "omit the header")
+        payload.writes = entries
     return payload
 
 
@@ -194,7 +210,7 @@ def _parse_unfenced(text: str) -> Payload | None:
 
     The header is the maximal contiguous run of leading lines that
     match a recognised metadata key (session / action / cwd /
-    timeout / attend) — the same `_HEADER_LINE` grammar and the same
+    timeout / attend / writes) — the same `_HEADER_LINE` grammar and the same
     value handling as `_parse_shell_body`, which does the actual
     parsing. The first line that is not a recognised-key line ends
     the header; everything from there on is the body, even lines that

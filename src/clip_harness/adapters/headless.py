@@ -14,7 +14,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from ..gate import Candidate, DecisionRecord, read_decision
+from ..gate import (Candidate, CommandCandidate, DecisionRecord,
+                    derive_allow_pattern, read_decision)
 
 
 class MemoryClipboard:
@@ -149,4 +150,62 @@ class TerminalDecider:
                                   if p.strip()]
         return DecisionRecord(decision=decision, reason=reason,
                               accepted_files=accepted_files,
+                              decided_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+
+
+class TerminalCommandDecider:
+    """Interactive terminal review of a held shell COMMAND (a
+    CommandCandidate): the presentation shows the full command, its
+    scope and the gate's reason, then an explicit decision:
+
+    - accept            — run it under the Seatbelt sandbox;
+    - accept unsandboxed — run it bare (offered only when the
+      `shell_sandbox` setting is "optional"; "strict" removes it);
+    - always allow      — accept sandboxed AND persist the shown
+      allowlist pattern to the project settings, so this command
+      shape is not held again;
+    - reject (+reason)  — nothing runs; the reason goes back to the
+      model in the denial result;
+    - Enter / EOF       — no decision: the command stays parked as a
+      candidate (never inferred).
+    """
+
+    def __init__(self, input_fn=input, out=print,
+                 shell_sandbox: str = "optional"):
+        self.input_fn = input_fn
+        self.out = out
+        self.shell_sandbox = shell_sandbox
+
+    def __call__(self, candidate: CommandCandidate) -> DecisionRecord | None:
+        self.out(candidate.presentation(self.shell_sandbox))
+        pattern = derive_allow_pattern(candidate.command)
+        options = ["[a]ccept sandboxed"]
+        if self.shell_sandbox != "strict":
+            options.append("accept [u]nsandboxed")
+        if pattern:
+            options.append(f"al[w]ays allow '{pattern}'")
+        options.append("[r]eject")
+        prompt = " / ".join(options) + " / Enter = decide later: "
+        try:
+            answer = self.input_fn(prompt).strip().lower()
+        except EOFError:
+            return None
+        if answer in ("a", "accept"):
+            decision = "accept"
+        elif answer in ("u", "unsandboxed", "accept-unsandboxed") \
+                and self.shell_sandbox != "strict":
+            decision = "accept-unsandboxed"
+        elif answer in ("w", "always", "always-allow") and pattern:
+            decision = "always-allow"
+        elif answer in ("r", "reject"):
+            decision = "reject"
+        else:
+            return None
+        reason = ""
+        if decision == "reject":
+            try:
+                reason = self.input_fn("reason (optional): ").strip()
+            except EOFError:
+                reason = ""
+        return DecisionRecord(decision=decision, reason=reason,
                               decided_at=time.strftime("%Y-%m-%dT%H:%M:%S"))

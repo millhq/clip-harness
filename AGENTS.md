@@ -63,9 +63,17 @@ npm test
 ````
 
 - The first lines may be a metadata header of `key: value` lines.
-  Recognised keys: `session`, `action`, `cwd`, `timeout`, `attend`.
-  Everything after the header is shell text, run with the user's
-  shell in `cwd` (default: wherever the harness was triggered).
+  Recognised keys: `session`, `action`, `cwd`, `timeout`, `attend`,
+  `writes`. Everything after the header is shell text, run with the
+  user's shell in `cwd` (default: wherever the harness was
+  triggered).
+- `writes:` declares, comma-separated, the paths your command may
+  write (relative entries resolve against the effective `cwd`).
+  Declare it **honestly and completely** on any command that writes
+  files it generates itself (see "Reviewed shell commands" below):
+  the declaration is the scope the sandbox confines the command to
+  when the human accepts it sandboxed. An empty `writes:` is a
+  malformed payload — omit the header instead.
 - `attend: true` is the exception switch, not the norm: runs are
   async by default (the human is never blocked — see the mutation
   rules below). Set it only when the human is sitting at the
@@ -84,6 +92,37 @@ npm test
 - For the simple case you may also emit a **bare command with no
   fence at all** — it runs as a single unbound command when the human
   triggers it. Prefer the fence: it carries the session.
+
+## Reviewed shell commands
+
+A shell command that writes files (or is not on the human's
+allowlist) is **held for review before it runs** — it is never
+silently executed and never flatly refused just for mutating.
+The human sees the full command, the cwd and timeout, the reason
+it was held, and the write scope: your declared `writes:` paths
+plus the working directory and temp. They then decide:
+
+- **accept sandboxed** — the command runs confined by the OS
+  sandbox to that scope (a few protected paths — git hooks/config,
+  the harness's own settings — stay unwritable even inside it).
+  Writes outside the scope fail at the OS level, so declare
+  `writes:` honestly and completely: an undeclared output path
+  means a failed run, not a wider sandbox.
+- **accept unsandboxed** — the command runs bare (the human's
+  explicit choice; some setups disable it).
+- **always allow** — runs sandboxed, and the human's settings gain
+  an allowlist pattern for this command shape so it is not held
+  again.
+- **reject** — nothing runs; the reason comes back to you in the
+  rejection text. Revise and re-propose.
+- **later** — the command parks as a *command candidate*; you get
+  the pending note. Wait for the outcome; do not re-send.
+
+This is the path for commands whose outputs are generated at
+runtime (scripts that produce evidence files, builds, generators)
+and therefore cannot be sent as ```file / ```patch fences. Prefer
+the fences when the change itself is declarable — they are
+reviewed as diffs; use a shell command + `writes:` when it is not.
 
 ## Emitting file changes: ```file and ```patch fences
 
@@ -191,6 +230,10 @@ files:
 
 - `$ …` is the command that **actually executed** (a gate hook may
   have rewritten your command — trust this line, not your memory).
+  A `$` line ending in `(reviewed · sandboxed)` or
+  `(reviewed · unsandboxed)` means the command was held for review
+  and ran only after the human accepted it — sandboxed (confined to
+  the declared scope) or bare, respectively.
 - `[exit N · Ts]` is the exit status and duration. Output is capped;
   if it says the full output is in a file, ask for the part you need
   with a follow-up command (e.g. `tail`/`grep` that file) instead of
@@ -220,7 +263,8 @@ Other things you may receive instead of a result block:
 - **Denial text** (`⛔ clip-harness: run denied — <reason>`): the
   gate refused the payload before execution (policy, allowlist, or a
   hook). Do not retry the same payload unchanged.
-- **Pending note** (`⏳ clip-harness: candidate … awaiting review`):
+- **Pending note** (`⏳ clip-harness: candidate … awaiting review`,
+  or `… command candidate … held for review` for a shell command):
   the human hasn't decided yet. Wait for them to paste the outcome;
   do not re-send the payload.
 

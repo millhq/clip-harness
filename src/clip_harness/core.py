@@ -139,6 +139,11 @@ class Payload:
     timeout: float | None = None  # header timeout override, seconds
     attend: bool = False  # header `attend: true` — wait inline for the
     # review decision instead of parking the run in pending_review
+    writes: list[str] = field(default_factory=list)  # header `writes:`
+    # — the paths a shell command DECLARES it may write (comma-separated
+    # in the header, as written; resolved against the effective cwd at
+    # review time). The declaration scopes the Seatbelt sandbox a
+    # reviewed command runs under; it never widens anything by itself.
 
     @property
     def bound(self) -> bool:
@@ -325,6 +330,7 @@ def format_result(command: str, output: str, exit_desc: str, elapsed: float,
                   output_file: str = "", *, files_section: str = "",
                   standing_section: str = "",
                   extra_section: str = "",
+                  command_note: str = "",
                   budget: int | None = None) -> str:
     """The ```result block that goes back on the clipboard.
 
@@ -342,12 +348,19 @@ def format_result(command: str, output: str, exit_desc: str, elapsed: float,
     the sticky footer (the core-generated [goal] / [open tasks] lines,
     bound runs only). The footer has a fixed shape and a fixed
     position — it is always the final section of a bound block.
+
+    `command_note` is the ONE annotation a reviewed shell run adds:
+    a parenthetical on the command echo line (e.g. "reviewed ·
+    sandboxed") recording that the command was held for review and
+    the mode the human approved. Empty for ordinary runs — the block
+    is otherwise byte-stable.
     """
     body = output if output else "(no output)"
     if output:
         limit = DEFAULT_RESULT_BUDGET_CHARS if budget is None else budget
         body = elide_output(output, limit, output_file).text
-    block = f"```result\n$ {command}\n{body}\n[exit {exit_desc} · {elapsed:.1f}s]"
+    echo = f"$ {command}" + (f" ({command_note})" if command_note else "")
+    block = f"```result\n{echo}\n{body}\n[exit {exit_desc} · {elapsed:.1f}s]"
     for section in (files_section, extra_section, standing_section):
         if section:
             block += f"\n{section}"

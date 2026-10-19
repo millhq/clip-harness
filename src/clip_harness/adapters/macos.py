@@ -40,8 +40,10 @@ class PbClipboard:
 
 
 class VSCodeDiffOpener:
-    """Opens the review in VS Code: the manifest summary FIRST, then a
-    diff per file — Ali reviews on disk, never by reading chat text."""
+    """The deep-review option: opens the staged candidate in VS Code —
+    the manifest summary FIRST, then a diff per file. The default
+    review surface is the inline diff in the terminal; this is for
+    when a change deserves the full editor."""
 
     def __init__(self, code_cmd: str = "code"):
         self.code_cmd = code_cmd

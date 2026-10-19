@@ -1,7 +1,8 @@
 """clip-harness command line.
 
-The DEFAULT entry (no arguments) is the static trigger path: Ali's
-chain is an Apple Shortcut (⌘+Shift+P) opening iTerm2 plus an iTerm2
+The DEFAULT entry (no arguments) is the static trigger path: the
+chain is the user's own Apple Shortcut/hotkey (e.g. Cmd+Shift+E)
+opening iTerm2 plus an iTerm2
 hotkey firing a fixed sequence that runs this CLI — so zero arguments
 must do the whole job: read clipboard, parse, run, result back to
 clipboard. Everything variable comes from the block itself. On this
@@ -54,10 +55,16 @@ def _default_clipboard():
 
 
 def _default_decider():
+    """The inline decision channel. Consulted ONLY for `attend: true`
+    payloads (async runs park instead), so the headless file-drop
+    decider may poll generously: drop a decision.json into the
+    candidate directory to decide an attended run. The wait is
+    bounded by CLIP_HARNESS_ATTEND_WAIT_S (default 600s)."""
     from .adapters.headless import FileDropDecider, TerminalDecider
     if sys.stdin.isatty():
         return TerminalDecider()
-    return FileDropDecider(timeout_s=0)
+    wait = float(os.environ.get("CLIP_HARNESS_ATTEND_WAIT_S", "600"))
+    return FileDropDecider(timeout_s=wait)
 
 
 def _default_diff_opener():
@@ -264,7 +271,7 @@ def cmd_candidate(args) -> int:
         return 1
     candidate = load_candidate(candidate_dir)
     if args.candidate_cmd == "show":
-        print(candidate.summary())
+        print(candidate.presentation())
         return 0
     if args.candidate_cmd == "decide":
         if not args.decision:
@@ -363,7 +370,13 @@ def cmd_finish(args) -> int:
         return 1
     block = runner.result_for(run_id)
     if block is None:
-        print(f"clip-harness: no finished result for run {run_id}",
+        # Still attempt the close: for a run parked in pending_review
+        # this RECORDS the deferred close (RunClosed receipt) instead
+        # of silently dropping the run.
+        closed = runner.close_run(run_id)
+        print(f"clip-harness: no finished result for run {run_id} — "
+              + ("closed" if closed else
+                 "close deferred: a review decision is still pending"),
               file=sys.stderr)
         return 1
     closed = runner.close_run(run_id)

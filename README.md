@@ -30,8 +30,9 @@ For iTerm2 tab execution (optional): `pipx install 'clip-harness[iterm2]'`.
 
 ## Quick start
 
-1. Wire the trigger: an Apple Shortcut (⌘+Shift+P) that opens iTerm2,
-   plus an iTerm2 hotkey whose fixed sequence runs `clip-harness` with
+1. Wire the trigger: your own Apple Shortcut/hotkey (e.g. Cmd+Shift+E)
+   that opens iTerm2, plus an iTerm2 hotkey whose fixed sequence runs
+   `clip-harness` with
    **no arguments**. Zero arguments is the static trigger path: read
    clipboard → parse → run → result back to clipboard. Everything
    variable comes from the payload block itself.
@@ -147,14 +148,39 @@ text. Recognised keys:
   `task-open` (these require a session).
 - `cwd:` — working directory override.
 - `timeout:` — per-command timeout in seconds.
+- `attend:` — `true` opts this run into attended mode (below);
+  anything else, or absent, is async.
 
 (```run is accepted as a legacy alias for ```shell.)
+
+### Execution modes
+
+The loop is fire-and-forget by design — the human is never blocked
+waiting on it:
+
+- **Async (default).** The trigger fires, the run executes, the
+  window is free to hide immediately, and a notification arrives
+  when the run finishes (`PostRun` / `PostRunFailure` hooks). A
+  payload with file changes **parks**: the candidate is staged, the
+  `ReviewDecision` *pending* notification fires, and the run waits
+  in `pending_review` — the trigger invocation returns without a
+  decision. The decision arrives later (`candidate review` /
+  `decide` / `apply`, or a `decision.json` drop); only then do
+  apply, receipt, clipboard, and the completion notification
+  happen. For a parked review, rejecting *is* the steering.
+- **Attended (`attend: true`).** The trigger waits inline: the
+  review surface (manifest, then inline diffs) is presented in the
+  terminal, the decision is taken there, and progress is visible —
+  for the runs where the human wants to sit in the loop. Plain
+  commands never park in either mode; `cancel` steers a running
+  command in both.
 
 ### File fences — the mutation branch
 
 One copied message may carry several fences: one ```shell fence plus
 one fence per file. A file fence carries the FULL content — the human
-reviews on disk in VS Code, never by reading the chat:
+reviews the actual bytes as an inline diff in the terminal (below),
+never a description in the chat:
 
 ````
 ```file
@@ -190,22 +216,43 @@ $ npm test
 [exit 0 · 3.2s]
 files:
   ✓ src/auth.py — UPDATED
-— goal: Ship the auth refactor [active]
-  open tasks: [doing] wire tokens · [open] update tests
+    --- a/src/auth.py
+    +++ b/src/auth.py
+    @@ -10,3 +10,3 @@
+     unchanged context
+    -old line
+    +new line
 — capabilities:
   ...
+[goal] Ship the auth refactor [active]
+[open tasks] [doing] wire tokens · [open] update tests
 ```
 ````
 
-- The `files:` section appears when a mutation was applied, with
-  NEW/UPDATED/DELETED tags (and ✗ lines for rejected entries).
-- The **goal/open-tasks section is core-generated and appears in every
-  session-bound result block**, hooks or no hooks. Unbound runs carry
-  neither it nor manifest refreshes.
-- The **capability manifest** (next section) is refreshed into the
-  block when it changes — once per change per session.
-- A rejection puts plain rejection text on the clipboard instead (with
-  the reason), ready to paste back so the model can re-propose.
+**One artifact, two audiences.** The result block is a single shared
+artifact: the text rendered in the terminal and the text on the
+clipboard are the *same bytes* — what the human sees is exactly what
+the model reads when it is pasted back. There is no prettier human
+version and no separate machine version.
+
+- The `files:` section appears when a mutation was decided, with
+  NEW/UPDATED/DELETED tags (and ✗ lines for rejected entries). Each
+  entry is followed by its **inline diff** — applied and rejected
+  alike — so the paste-back shows the model its own proposal exactly
+  as rendered and what happened to it. Diffs are capped per file
+  (80 lines / 6000 chars) with a `… N more lines — full diff in
+  <candidate dir>` pointer.
+- **Sticky footer.** Every session-bound block ENDS with the same
+  two lines in the same position: `[goal] …` then `[open tasks] …`.
+  The footer is **core-generated** (never hook-supplied) and appears
+  in every bound block, hooks or no hooks, so both the human and the
+  model are re-anchored on the goal and the open tasks every round
+  trip. Hook `additionalContext`, capability-manifest refreshes, and
+  pending state all sit *above* the footer; the footer is always
+  last. Unbound runs carry neither the footer nor manifest refreshes.
+- A rejection puts plain rejection text on the clipboard instead
+  (the rejected diffs included, marked rejected, with the reason),
+  ready to paste back so the model can re-propose.
 
 ## Goal/task state (core)
 
@@ -289,15 +336,25 @@ to stderr):
 
 File payloads are never written live. The gate classifies each file
 against disk, stages candidates with base hashes and a manifest, and
-presents the **manifest summary first** (path · op · line counts),
-then opens VS Code (`code --diff` per update, the candidate for
-creates, the live file for deletes). The decision is captured as data
-(`decision.json`: `accept` / `accept-edited` / `reject` + optional
-reason + optional per-file `accepted_files`). Apply runs only on
-accept, applies only accepted entries, verifies post-apply hashes,
-and rolls back from the pre-apply snapshots on partial failure. On
-reject: no post hooks fire, the receipt records the denial, and the
-clipboard gets the rejection text.
+the review surface presents the **manifest first** (path · op · line
+counts), **then each change as an inline unified diff** in the
+terminal — a create renders as a full addition, a delete as the
+removed content, an update as a compact diff with context lines,
+each capped with a pointer to the candidate directory for the full
+diff. That inline diff is the default review surface; VS Code
+(`code --diff` per update, the candidate for creates, the live file
+for deletes) remains available as the deep-review option for the
+same staged candidate. In async mode (the default) none of this
+holds the trigger: the run parks and the surface is presented when
+the human comes to decide (`candidate review` / `candidate show`);
+in attended mode it is presented inline at staging time. The
+decision is captured as data (`decision.json`: `accept` /
+`accept-edited` / `reject` + optional reason + optional per-file
+`accepted_files`). Apply runs only on accept, applies only accepted
+entries, verifies post-apply hashes, and rolls back from the
+pre-apply snapshots on partial failure. On reject: no post hooks
+fire, the receipt records the denial, and the clipboard gets the
+rejection text (rejected diffs included).
 
 Built-in policy runs before hooks: hard-block patterns are evaluated
 **before** the allowlist (exit-2 semantics); a denylist match denies;

@@ -100,14 +100,14 @@ class GoalStore:
         """
         goal = self._data["goal"]
         if goal is None:
-            goal_line = "— goal: (none set)"
+            goal_line = "[goal] (none set)"
         else:
-            goal_line = f"— goal: {goal['title']} [{goal['status']}]"
+            goal_line = f"[goal] {goal['title']} [{goal['status']}]"
         open_tasks = self.open_tasks()
         if open_tasks:
             listing = " · ".join(
                 f"[{t['status']}] {t['title']}" for t in open_tasks)
-            tasks_line = f"  open tasks: {listing}"
+            tasks_line = f"[open tasks] {listing}"
         else:
-            tasks_line = "  open tasks: none"
+            tasks_line = "[open tasks] none"
         return f"{goal_line}\n{tasks_line}"

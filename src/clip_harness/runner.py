@@ -177,7 +177,10 @@ class LifecycleRunner:
                             "sha256": ctx.clipboard_sha256,
                             "bytes": len(text),
                             "files": len(payload.files),
-                            "bound": payload.bound},
+                            "bound": payload.bound,
+                            # The header's free-form action label,
+                            # echoed into the receipt as documented.
+                            "action": payload.action},
                            session_id=self.session_id,
                            binding_id=payload.session_id)
         outcome = self._dispatch(Event.PAYLOAD_CAPTURED, ctx,
@@ -239,7 +242,8 @@ class LifecycleRunner:
                     f"they can be reviewed as a diff.")
             self._set_clipboard(note)
             return RunOutcome(run_id, RunState.PENDING_REVIEW,
-                              f"held pending review: {verdict.reason}")
+                              f"held pending review: {verdict.reason}",
+                              result_block=note)
 
         if not command.strip():
             return self._complete_files_only(ctx, handle, files_section)
@@ -364,13 +368,23 @@ class LifecycleRunner:
                            session_id=self.session_id,
                            binding_id=payload.session_id)
         self._dispatch_review(ctx, "staged", run_id, None)
-        self.presenter(candidate.summary()
-                       + (f"\n  shell: {payload.command}"
-                          if payload.command else ""))
-        if self.diff_opener is not None:
-            self.diff_opener(candidate)
-
-        record = self.decider(candidate) if self.decider else None
+        # Execution modes: async is the default — the candidate is
+        # staged, the pending notification fires, and the run PARKS in
+        # pending_review; the trigger invocation returns without a
+        # decision. Only an `attend: true` payload waits inline: the
+        # review surface (manifest + inline diffs) is presented and
+        # the decision is taken in the terminal. The same surface is
+        # presented at decision time for parked runs (candidate
+        # review / show) — never by holding the trigger hostage.
+        record = None
+        if payload.attend:
+            self.presenter(candidate.presentation()
+                           + (f"\n  shell: {payload.command}"
+                              if payload.command else ""))
+            if self.diff_opener is not None:
+                self.diff_opener(candidate)
+            if self.decider is not None:
+                record = self.decider(candidate)
         if record is None:
             self.registry.set_state(handle, RunState.PENDING_REVIEW.value)
             self.ledger.append(run_id, Event.REVIEW_DECISION.value,
@@ -384,6 +398,7 @@ class LifecycleRunner:
             self._set_clipboard(note)
             return RunOutcome(run_id, RunState.PENDING_REVIEW,
                               "candidate staged, awaiting review",
+                              result_block=note,
                               candidate_id=run_id)
         return self._apply_decision(ctx, handle, candidate, record)
 
@@ -408,6 +423,9 @@ class LifecycleRunner:
                      + (f" — {record.reason}" if record.reason else "")]
             for entry in candidate.entries:
                 lines.append(f"  ✗ {entry.path} — rejected")
+                diff = gate_mod.render_diff(candidate, entry)
+                if diff:
+                    lines.extend(f"    {ln}" for ln in diff.splitlines())
             text = "\n".join(lines)
             self._set_clipboard(text)
             if self.transcript:
@@ -416,7 +434,8 @@ class LifecycleRunner:
             self.registry.set_state(handle, RunState.REJECTED.value)
             self._close(ctx, handle)
             return RunOutcome(run_id, RunState.REJECTED,
-                              f"rejected: {record.reason}".strip())
+                              f"rejected: {record.reason}".strip(),
+                              result_block=text)
 
         report = gate_mod.apply_candidate(candidate, record)
         self.ledger.append(run_id, Event.REVIEW_DECISION.value,
@@ -433,8 +452,8 @@ class LifecycleRunner:
                 + (" — rolled back" if report.rolled_back else ""),
                 extra={"stage": "apply", "rolled_back": report.rolled_back,
                        "entries": [vars(e) for e in report.entries]},
-                files_section="files:\n" + "\n".join(report.outcome_lines()))
-        return "files:\n" + "\n".join(report.outcome_lines())
+                files_section=report.section())
+        return report.section()
 
     def review_candidate(self, candidate_id: str,
                          decider) -> RunOutcome:
@@ -519,11 +538,11 @@ class LifecycleRunner:
         output = "\n".join(output_lines) or "(no change)"
         ctx.command_executed = f"({payload.action}) {body}".strip()
         tool_response = {"exit_desc": "0", "output": output}
-        self._dispatch(Event.POST_RUN, ctx, tool_name="Session",
-                       tool_input={"action": payload.action},
-                       tool_use_id=run_id,
-                       extra={"tool_response": tool_response,
-                              "error": None, "duration_ms": 0})
+        outcome = self._dispatch(Event.POST_RUN, ctx, tool_name="Session",
+                                 tool_input={"action": payload.action},
+                                 tool_use_id=run_id,
+                                 extra={"tool_response": tool_response,
+                                        "error": None, "duration_ms": 0})
         self.ledger.append(run_id, Event.POST_RUN.value,
                            {"status": "ok", "tool_name": "Session",
                             "tool_input": {"action": payload.action},
@@ -533,7 +552,8 @@ class LifecycleRunner:
                            binding_id=payload.session_id)
         block = format_result(ctx.command_executed, output, "0", 0.0, "",
                               standing_section=store.section(),
-                              extra_section=self._manifest_section(ctx))
+                              extra_section=self._extra_section(
+                                  ctx, outcome))
         self._save_result(run_id, block)
         self._set_clipboard(block)
         self.registry.set_state(handle, RunState.COMPLETED.value)
@@ -605,7 +625,8 @@ class LifecycleRunner:
                               result.elapsed, handle.output_file,
                               files_section=files_section,
                               standing_section=self._standing(ctx),
-                              extra_section=self._manifest_section(ctx))
+                              extra_section=self._extra_section(
+                                  ctx, outcome))
         self._save_result(run_id, block)
         if self.transcript:
             capped, _ = cap_output(display_output, handle.output_file)
@@ -628,10 +649,10 @@ class LifecycleRunner:
                              files_section: str) -> RunOutcome:
         run_id = ctx.run_id
         tool_response = {"exit_desc": "0", "files_applied": True}
-        self._dispatch(Event.POST_RUN, ctx, tool_name="Write",
-                       tool_input={}, tool_use_id=run_id,
-                       extra={"tool_response": tool_response,
-                              "error": None, "duration_ms": 0})
+        outcome = self._dispatch(Event.POST_RUN, ctx, tool_name="Write",
+                                 tool_input={}, tool_use_id=run_id,
+                                 extra={"tool_response": tool_response,
+                                        "error": None, "duration_ms": 0})
         self.ledger.append(run_id, Event.POST_RUN.value,
                            {"status": "ok", "tool_name": "Write",
                             "tool_response": tool_response,
@@ -642,7 +663,8 @@ class LifecycleRunner:
                               "0", 0.0, "",
                               files_section=files_section,
                               standing_section=self._standing(ctx),
-                              extra_section=self._manifest_section(ctx))
+                              extra_section=self._extra_section(
+                                  ctx, outcome))
         self._save_result(run_id, block)
         self._set_clipboard(block)
         self.registry.set_state(handle, RunState.COMPLETED.value)
@@ -668,15 +690,19 @@ class LifecycleRunner:
                                        text, "denied", 0.0)
         self.registry.set_state(handle, RunState.DENIED.value)
         self._close(ctx, handle)
-        return RunOutcome(ctx.run_id, RunState.DENIED, f"denied: {reason}")
+        # Single-artifact rule: the text on the clipboard IS the
+        # outcome's block — the terminal shows the same bytes.
+        return RunOutcome(ctx.run_id, RunState.DENIED, f"denied: {reason}",
+                          result_block=text)
 
     def _fail(self, ctx: RunContext, handle: RunHandle, reason: str,
               extra: dict | None = None,
               files_section: str = "") -> RunOutcome:
-        self._dispatch(Event.POST_RUN_FAILURE, ctx, tool_name="Bash",
-                       tool_input={"command": ctx.command_executed},
-                       tool_use_id=ctx.run_id,
-                       extra={"error": reason, "duration_ms": 0})
+        outcome = self._dispatch(Event.POST_RUN_FAILURE, ctx,
+                                 tool_name="Bash",
+                                 tool_input={"command": ctx.command_executed},
+                                 tool_use_id=ctx.run_id,
+                                 extra={"error": reason, "duration_ms": 0})
         self.ledger.append(ctx.run_id, Event.POST_RUN_FAILURE.value,
                            {"status": "failed", "error": reason,
                             **(extra or {})},
@@ -686,7 +712,8 @@ class LifecycleRunner:
                               f"FAILED: {reason}", "error", 0.0, "",
                               files_section=files_section,
                               standing_section=self._standing(ctx),
-                              extra_section=self._manifest_section(ctx))
+                              extra_section=self._extra_section(
+                                  ctx, outcome))
         self._save_result(ctx.run_id, block)
         self._set_clipboard(block)
         self.registry.set_state(handle, RunState.FAILED.value)
@@ -703,7 +730,8 @@ class LifecycleRunner:
         note = f"⛔ clip-harness: malformed payload — {error}"
         self._set_clipboard(note)
         return RunOutcome(run_id, RunState.DENIED,
-                          f"malformed payload: {error}")
+                          f"malformed payload: {error}",
+                          result_block=note)
 
     def _handle_trigger(self, payload: Payload, cwd: str) -> RunOutcome:
         if payload.kind == "cancel":
@@ -777,6 +805,26 @@ class LifecycleRunner:
                                  cwd=handle.cwd,
                                  session_id=self.session_id)
                 return self._close(ctx, handle)
+        # Unbound runs are not persisted in the registry, but a run
+        # with a staged candidate must still record its (deferred)
+        # close rather than vanish — rebuild a handle from the
+        # candidate manifest, which carries cwd/session/shell data.
+        manifest_path = (self.state_dir / "candidates" / run_id
+                         / "manifest.json")
+        if manifest_path.exists():
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8"))
+            handle = RunHandle(
+                run_id=run_id,
+                command=manifest.get("shell_command", ""),
+                cwd=manifest.get("cwd", ""),
+                binding_id=manifest.get("session_id"))
+            ctx = RunContext(run_id=run_id,
+                             payload=Payload(command=handle.command,
+                                             session_id=handle.binding_id),
+                             cwd=handle.cwd,
+                             session_id=self.session_id)
+            return self._close(ctx, handle)
         return False
 
     # ------------------------------------------------------------------
@@ -795,6 +843,23 @@ class LifecycleRunner:
             return ""
         return self.manifest.pending_section(ctx.binding_id,
                                              self.settings.tools)
+
+    def _extra_section(self, ctx: RunContext, outcome=None) -> str:
+        """The variable middle of a result block — everything that is
+        neither the file outcome nor the sticky footer: hook-supplied
+        context first, then a refreshed capability manifest. The
+        footer (standing section) is appended after this, always
+        last."""
+        parts: list[str] = []
+        if outcome is not None and outcome.additional_context:
+            lines = ["— hook context:"]
+            for text in outcome.additional_context:
+                lines.extend(f"  {ln}" for ln in text.splitlines())
+            parts.append("\n".join(lines))
+        manifest = self._manifest_section(ctx)
+        if manifest:
+            parts.append(manifest)
+        return "\n".join(parts)
 
     def _dispatch(self, event: Event, ctx: RunContext, *,
                   tool_name: str, tool_input: dict, tool_use_id: str,

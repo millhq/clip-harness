@@ -346,6 +346,10 @@ FILE_PAYLOAD = ("```file\npath: src/new.py\nop: create\n"
                 "print('new')\n```")
 FILE_PAYLOAD_BOUND = ("```shell\nsession: rev-1\necho after-apply\n```\n"
                       + FILE_PAYLOAD)
+# Same mutation, attended: the header-only shell fence opts the run
+# into waiting inline for the decider (async is the default — a bare
+# FILE_PAYLOAD parks in pending_review; see the park tests above).
+FILE_PAYLOAD_ATTENDED = ("```shell\nattend: true\n```\n" + FILE_PAYLOAD)
 
 
 def test_no_decision_leaves_run_pending_and_close_refused(
@@ -390,10 +394,12 @@ def test_accept_applies_and_reports_new_tag(make_runner, tmp_path):
     work.mkdir()
     runner = make_runner(
         decider=StaticDecider(DecisionRecord(decision="accept")))
-    outcome = runner.process_text(FILE_PAYLOAD, str(work))
+    outcome = runner.process_text(FILE_PAYLOAD_ATTENDED, str(work))
     assert outcome.state == RunState.COMPLETED
     assert (work / "src" / "new.py").read_text() == "print('new')\n"
     assert "✓ src/new.py — NEW" in outcome.result_block
+    # The result block carries the applied change as an inline diff.
+    assert "+print('new')" in outcome.result_block
 
 
 def test_rejection_fires_no_postrun_and_writes_rejection_text(
@@ -408,10 +414,14 @@ def test_rejection_fires_no_postrun_and_writes_rejection_text(
                              executor=FakeExecutor())
     work = tmp_path / "work"
     work.mkdir()
-    outcome = runner.process_text(FILE_PAYLOAD, str(work))
+    outcome = runner.process_text(FILE_PAYLOAD_ATTENDED, str(work))
     assert outcome.state == RunState.REJECTED
     assert not (work / "src" / "new.py").exists()
     assert "changes rejected — wrong layer" in clipboard.text
+    # The rejected proposal is shown in the clipboard text, as a diff
+    # marked rejected — the model sees what was refused.
+    assert "✗ src/new.py — rejected" in clipboard.text
+    assert "+print('new')" in clipboard.text
     seen = record.read_text().splitlines()
     assert "PostRun" not in seen and "PostRunFailure" not in seen
     events = [n for n, _ in ledger_events(runner, outcome.run_id)]
@@ -428,8 +438,12 @@ def test_manifest_summary_is_presented_first(make_runner, tmp_path):
         clipboard=MemoryClipboard(),
         decider=StaticDecider(DecisionRecord(decision="accept")),
         presenter=presented.append, executor=FakeExecutor())
-    runner.process_text(FILE_PAYLOAD, str(work))
+    runner.process_text(FILE_PAYLOAD_ATTENDED, str(work))
+    # Review surface: manifest first, then the inline diff.
     assert presented and "src/new.py · NEW" in presented[0]
+    assert "+print('new')" in presented[0]
+    assert presented[0].index("src/new.py · NEW") \
+        < presented[0].index("+print('new')")
 
 
 def test_shell_plus_files_reviews_then_runs(make_runner, tmp_path):
@@ -439,7 +453,7 @@ def test_shell_plus_files_reviews_then_runs(make_runner, tmp_path):
     runner = make_runner(
         decider=StaticDecider(DecisionRecord(decision="accept")),
         executor=executor)
-    text = ("```shell\nmake test\n```\n"
+    text = ("```shell\nattend: true\nmake test\n```\n"
             "```file\npath: a.txt\nhello\n```")
     outcome = runner.process_text(text, str(work))
     assert outcome.state == RunState.COMPLETED
@@ -461,18 +475,25 @@ def test_bound_result_carries_goal_section_with_zero_hooks(make_runner):
     store.set_task_status("old task", "done")
     outcome = runner.process_text(
         shell_payload("echo go", session="auth-1"), "/tmp")
-    assert "— goal: Ship the auth refactor [active]" in \
+    assert "[goal] Ship the auth refactor [active]" in \
         outcome.result_block
     assert "[doing] wire tokens" in outcome.result_block
     assert "[open] update tests" in outcome.result_block
     assert "old task" not in outcome.result_block  # done tasks drop off
+    # Sticky footer: the [goal]/[open tasks] pair is the last section
+    # of the block (just inside the closing fence, when fenced).
+    lines = outcome.result_block.rstrip().splitlines()
+    if lines and lines[-1] == "```":
+        lines = lines[:-1]
+    assert lines[-2] == "[goal] Ship the auth refactor [active]"
+    assert lines[-1].startswith("[open tasks] ")
 
 
 def test_goal_update_changes_next_result_block(make_runner):
     runner = make_runner()
     first = runner.process_text(
         shell_payload("echo 1", session="g1"), "/tmp")
-    assert "— goal: (none set)" in first.result_block
+    assert "[goal] (none set)" in first.result_block
     op = runner.process_text(
         "```shell\nsession: g1\naction: goal-set\n"
         "Migrate the billing jobs\n```", "/tmp")
@@ -480,7 +501,7 @@ def test_goal_update_changes_next_result_block(make_runner):
     assert "goal set: Migrate the billing jobs" in op.result_block
     second = runner.process_text(
         shell_payload("echo 2", session="g1"), "/tmp")
-    assert "— goal: Migrate the billing jobs [active]" \
+    assert "[goal] Migrate the billing jobs [active]" \
         in second.result_block
 
 
@@ -494,7 +515,7 @@ def test_task_action_ops_round_trip(make_runner):
         "/tmp")
     assert "task done: first task" in op.result_block
     assert "[open] second task" in op.result_block
-    assert "first task" not in op.result_block.split("open tasks:")[1]
+    assert "first task" not in op.result_block.split("[open tasks]")[1]
 
 
 def test_action_op_without_session_is_denied(make_runner):
@@ -587,3 +608,39 @@ def test_config_change_is_receipted(make_runner, tmp_path):
     second.arm("/tmp")
     events = [e["event"] for e in second.ledger.entries()]
     assert "ConfigChange" in events
+
+
+def test_mutation_parks_by_default_even_with_a_decider(
+        make_runner, tmp_path):
+    """Async is the default execution mode: a configured decider is
+    NOT consulted inline — the run parks in pending_review and the
+    trigger returns (fire-and-forget). Only `attend: true` waits."""
+    work = tmp_path / "work"
+    work.mkdir()
+    runner = make_runner(
+        decider=StaticDecider(DecisionRecord(decision="accept")))
+    outcome = runner.process_text(FILE_PAYLOAD, str(work))
+    assert outcome.state == RunState.PENDING_REVIEW
+    assert not (work / "src" / "new.py").exists()  # nothing applied yet
+    # The parked run completes when the decision arrives later.
+    done = runner.review_candidate(
+        outcome.run_id,
+        StaticDecider(DecisionRecord(decision="accept")))
+    assert done.state == RunState.COMPLETED
+    assert (work / "src" / "new.py").read_text() == "print('new')\n"
+
+
+def test_unbound_pending_run_close_is_deferred_not_dropped(
+        make_runner, tmp_path):
+    """Regression: unbound runs are not persisted in the registry, so
+    close_run used to miss them entirely and record nothing. A staged
+    candidate rebuilds the handle from its manifest."""
+    work = tmp_path / "work"
+    work.mkdir()
+    runner = make_runner(decider=None)
+    outcome = runner.process_text(FILE_PAYLOAD, str(work))  # unbound
+    assert outcome.state == RunState.PENDING_REVIEW
+    assert runner.close_run(outcome.run_id) is False
+    entries = runner.ledger.entries(run_id=outcome.run_id)
+    closed = [e for e in entries if e["event"] == "RunClosed"]
+    assert closed and closed[-1]["data"]["status"] == "deferred"

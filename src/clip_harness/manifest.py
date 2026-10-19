@@ -27,7 +27,7 @@ BUILTIN_TOOLS: list[dict] = [
         "description": "Run shell commands; output returns in a "
                        "```result block.",
         "shape": "```shell fence; header lines session:/action:/cwd:/"
-                 "timeout:, then the commands",
+                 "timeout:/attend:, then the commands",
     },
     {
         "name": "file.write",

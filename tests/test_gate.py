@@ -219,3 +219,52 @@ def test_base_moved_since_staging_fails_and_rolls_back(tmp_path):
     statuses = {e.path: e.status for e in report.entries}
     assert statuses["one.txt"] == "rolled-back"
     assert statuses["two.txt"] == "failed"
+
+
+# -- inline diff rendering -------------------------------------------------
+
+def test_render_diff_update_shows_plus_and_minus(tmp_path):
+    from clip_harness.gate import render_diff
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "a.txt").write_text("one\ntwo\nthree\n")
+    candidate = _stage(tmp_path, [FileSpec(
+        path="a.txt", declared_op="update",
+        content="one\nTWO\nthree\n")], work)
+    diff = render_diff(candidate, candidate.entries[0])
+    assert "-two" in diff and "+TWO" in diff
+    # The presentation heads each diff with path + op tag, manifest first.
+    text = candidate.presentation()
+    assert "a.txt" in text and "UPDATE" in text
+    assert text.index("+TWO") > text.index("a.txt")
+
+
+def test_render_diff_create_is_full_addition_and_capped(tmp_path):
+    from clip_harness.gate import MAX_DIFF_LINES, render_diff
+    work = tmp_path / "work"
+    work.mkdir()
+    big = "".join(f"line {i}\n" for i in range(300))
+    candidate = _stage(tmp_path, [FileSpec(
+        path="big.txt", declared_op="create", content=big)], work)
+    diff = render_diff(candidate, candidate.entries[0])
+    assert "+line 0" in diff
+    assert "-line" not in diff  # a create removes nothing
+    assert "more lines — full diff in" in diff
+    assert "line 299" not in diff  # capped, not dumped
+    assert len(diff.splitlines()) <= MAX_DIFF_LINES + 1
+
+
+def test_patch_without_trailing_newline_still_applies(tmp_path):
+    # Regression: the payload parser strips the fence's trailing
+    # newline, and git apply rejects unterminated patch lines
+    # ("corrupt patch at line N") — staging must restore it.
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "f.txt").write_text("a\nb\nc\n")
+    patch = ("--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n"
+             " a\n-b\n+B\n c")  # no trailing newline, as parsed
+    candidate = _stage(tmp_path, [FileSpec(
+        path="f.txt", declared_op="auto", patch=patch)], work)
+    entry = candidate.entries[0]
+    staged = (candidate.dir / "candidates" / entry.candidate_file)
+    assert staged.read_text() == "a\nB\nc\n"

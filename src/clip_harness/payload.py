@@ -13,7 +13,8 @@ A copied message is ONE payload made of fences:
     npm test
     ```
         Commands to run. The leading `key: value` lines are the metadata
-        header; recognised keys are session, action, cwd, timeout. The
+        header; recognised keys are session, action, cwd, timeout,
+        attend. The
         rest of the fence is shell text. `session:` binds the run to that
         session id (addressable for cancel/rerun, receipt keyed by it);
         without it the run is unbound but still runs.
@@ -55,7 +56,8 @@ _FENCE_OPEN = re.compile(
 _FENCE_OPEN_COUNT = re.compile(
     r"^```(shell|run|file|patch)\b", re.MULTILINE)
 _HEADER_LINE = re.compile(
-    r"^(session|action|cwd|timeout)\s*:\s*(.*?)\s*$", re.IGNORECASE)
+    r"^(session|action|cwd|timeout|attend)\s*:\s*(.*?)\s*$",
+    re.IGNORECASE)
 _PATH_LINE = re.compile(r"^path\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _OP_LINE = re.compile(r"^op\s*:\s*(create|update|delete|auto)\s*$", re.IGNORECASE)
 _ATTR_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)=(.*)$")
@@ -130,6 +132,9 @@ def _parse_shell_body(body: str, fence_attrs: dict[str, str]) -> Payload:
         except ValueError:
             raise PayloadError(
                 f"bad timeout in payload header: {header['timeout']!r}")
+    if header.get("attend"):
+        payload.attend = header["attend"].strip().lower() in (
+            "true", "yes", "1")
     return payload
 
 

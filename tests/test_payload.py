@@ -139,3 +139,11 @@ def test_bare_never_reruns_own_output():
 
 def test_bare_empty_is_none():
     assert parse_clipboard_text("   \n ", allow_bare=True) is None
+
+
+def test_attend_header_opts_into_inline_review():
+    payload = parse_payload("```shell\nattend: true\necho hi\n```")
+    assert payload.attend is True
+    assert payload.command == "echo hi"
+    plain = parse_payload("```shell\necho hi\n```")
+    assert plain.attend is False

@@ -130,6 +130,8 @@ class Payload:
     action: str = ""  # free-form header label, echoed into the receipt
     cwd: str = ""  # header cwd override ("" = inherit)
     timeout: float | None = None  # header timeout override, seconds
+    attend: bool = False  # header `attend: true` — wait inline for the
+    # review decision instead of parking the run in pending_review
 
     @property
     def bound(self) -> bool:
@@ -206,8 +208,11 @@ def format_result(command: str, output: str, exit_desc: str, elapsed: float,
 
     Optional sections, appended inside the fence after the exit line:
     `files_section` (the applied/rejected file outcome), then
-    `standing_section` (the core goal/task nag — bound runs only), then
-    `extra_section` (e.g. a refreshed capability manifest).
+    `extra_section` (hook context, a refreshed capability manifest,
+    pending state — the variable middle), then `standing_section` LAST:
+    the sticky footer (the core-generated [goal] / [open tasks] lines,
+    bound runs only). The footer has a fixed shape and a fixed
+    position — it is always the final section of a bound block.
     """
     body = output if output else "(no output)"
     if len(body) > MAX_CLIP_OUTPUT:
@@ -217,7 +222,7 @@ def format_result(command: str, output: str, exit_desc: str, elapsed: float,
             + f"\n…[truncated at 128k chars, full output in {pointer}]"
         )
     block = f"```result\n$ {command}\n{body}\n[exit {exit_desc} · {elapsed:.1f}s]"
-    for section in (files_section, standing_section, extra_section):
+    for section in (files_section, extra_section, standing_section):
         if section:
             block += f"\n{section}"
     return block + "\n```"

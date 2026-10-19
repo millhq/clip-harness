@@ -15,13 +15,13 @@ from clip_harness.settings import load_settings
 
 def test_goal_store_round_trip(tmp_path):
     store = GoalStore(tmp_path, "s1")
-    assert store.section().startswith("— goal: (none set)")
+    assert store.section().startswith("[goal] (none set)")
     store.set_goal("Ship it")
     store.add_task("one")
     store.add_task("two")
     store.set_task_status("one", "doing")
     section = store.section()
-    assert "— goal: Ship it [active]" in section
+    assert "[goal] Ship it [active]" in section
     assert "[doing] one" in section and "[open] two" in section
     # Persisted: a fresh instance sees the same state.
     again = GoalStore(tmp_path, "s1")

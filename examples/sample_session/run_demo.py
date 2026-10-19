@@ -103,8 +103,9 @@ def main() -> int:
     runner = LifecycleRunner(
         settings=settings, clipboard=clipboard,
         decider=FileDropDecider(timeout_s=15),
-        presenter=lambda summary: print("\nMANIFEST PRESENTED FIRST:\n"
-                                        + summary))
+        presenter=lambda text: print("\nREVIEW SURFACE PRESENTED "
+                                     "(manifest, then inline diffs):\n"
+                                     + text))
 
     print(f"demo workspace: {root}")
 
@@ -123,9 +124,11 @@ def main() -> int:
     assert outcome.state.value == "completed"
 
     # 2 — a mutation payload, accepted in review. (A header-only
-    # shell fence binds the run to the session without commands.)
+    # shell fence binds the run to the session without commands;
+    # `attend: true` makes this run wait inline for the reviewer's
+    # decision.json — the default mode would park it instead.)
     copilot(clipboard,
-            f"```shell\nsession: {SESSION}\n```\n"
+            f"```shell\nsession: {SESSION}\nattend: true\n```\n"
             "```file\npath: src/app.py\nop: update\nprint('v2')\n```\n"
             "```file\npath: src/feature.py\nop: create\n"
             "print('feature')\n```")
@@ -138,7 +141,7 @@ def main() -> int:
 
     # 3 — a mutation payload, rejected in review.
     copilot(clipboard,
-            f"```shell\nsession: {SESSION}\n```\n"
+            f"```shell\nsession: {SESSION}\nattend: true\n```\n"
             "```file\npath: README.md\nop: delete\n```\n"
             "```file\npath: src/app.py\nop: update\nprint('v3')\n```")
     outcome = runner.process_text(clipboard.get_text(), str(project),
@@ -154,7 +157,7 @@ def main() -> int:
                                   allow_bare=True)
     print("\nRESULT BLOCK:\n" + (outcome.result_block or outcome.message))
     assert outcome.state.value == "completed"
-    assert "— goal:" not in outcome.result_block
+    assert "[goal]" not in outcome.result_block
 
     runner.session_end(str(project))
     reviews.join(timeout=5)

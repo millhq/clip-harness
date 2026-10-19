@@ -158,6 +158,87 @@ class Candidate:
     def pending(self) -> bool:
         return not (self.dir / "decision.json").exists()
 
+    def presentation(self) -> str:
+        """The terminal review surface: manifest first, then each
+        file's inline diff, headed by path + op tag. (VS Code remains
+        available as the deep-review option for the same candidate.)"""
+        parts = [self.summary()]
+        for entry in self.entries:
+            diff = render_diff(self, entry)
+            if diff:
+                parts.append(f"  {entry.path} — {entry.actual_op}")
+                parts.extend(f"    {ln}" for ln in diff.splitlines())
+        return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Inline diff rendering — core transport, the default review surface
+# ---------------------------------------------------------------------------
+#
+# Claude Code shows a file write/update inline; clip-harness does the
+# same. Every staged change renders as a unified diff in the terminal
+# review presentation AND in the result block after the decision, so
+# the paste-back shows the model its own proposal exactly as rendered
+# and what happened to it. Rendering is capped per file — the block
+# never carries an unbounded diff; the pointer names the candidate
+# directory holding both full sides.
+
+MAX_DIFF_LINES = 80     # per-file rendered diff cap, lines
+MAX_DIFF_CHARS = 6000   # per-file rendered diff cap, chars
+
+
+def _entry_sides(candidate: "Candidate",
+                 entry: "CandidateEntry") -> tuple[bytes | None,
+                                                    bytes | None]:
+    """(live bytes, proposed bytes) for one entry, from the staged
+    snapshot/candidate files — so an accept-edited renders the bytes
+    that were actually applied."""
+    old = new = None
+    if entry.snapshot_file is not None:
+        old = (candidate.dir / "snapshots"
+               / entry.snapshot_file).read_bytes()
+    if entry.candidate_file is not None:
+        new = (candidate.dir / "candidates"
+               / entry.candidate_file).read_bytes()
+    if entry.actual_op == "NEW":
+        old = None
+    elif entry.actual_op == "DELETE":
+        new = None
+    return old, new
+
+
+def render_diff(candidate: "Candidate", entry: "CandidateEntry", *,
+                max_lines: int = MAX_DIFF_LINES,
+                max_chars: int = MAX_DIFF_CHARS) -> str:
+    """One entry's capped unified diff ('' when there is nothing to
+    show, e.g. a NO_CHANGE entry)."""
+    if entry.actual_op == "NO_CHANGE":
+        return ""
+    old, new = _entry_sides(candidate, entry)
+    old_lines = (old or b"").decode("utf-8", "replace").splitlines()
+    new_lines = (new or b"").decode("utf-8", "replace").splitlines()
+    lines = list(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile="/dev/null" if old is None else f"a/{entry.path}",
+        tofile="/dev/null" if new is None else f"b/{entry.path}",
+        lineterm="", n=3))
+    if not lines:
+        return ""
+    total = len(lines)
+    shown = lines
+    truncated = False
+    if len(shown) > max_lines:
+        shown = shown[:max_lines]
+        truncated = True
+    while shown and len("\n".join(shown)) > max_chars:
+        shown = shown[:-1]
+        truncated = True
+    out = list(shown)
+    if truncated:
+        out.append(f"… {total - len(shown)} more lines — "
+                   f"full diff in {candidate.dir}")
+    return "\n".join(out)
+
 
 def _count_diff(old: bytes | None, new: bytes | None) -> tuple[int, int]:
     old_lines = (old or b"").decode("utf-8", "replace").splitlines()
@@ -184,6 +265,10 @@ def _apply_patch(live: bytes | None, patch_text: str, rel_path: str) -> bytes:
         if live is not None:
             target.write_bytes(live)
         patch_file = root / "change.patch"
+        # git apply requires newline-terminated lines; the payload
+        # parser strips the fence's trailing newline, so restore it.
+        if not patch_text.endswith("\n"):
+            patch_text += "\n"
         patch_file.write_text(patch_text, encoding="utf-8")
         for strip in (None, "-p0"):
             cmd = ["git", "apply", "--whitespace=nowarn"]
@@ -330,6 +415,9 @@ class ApplyEntryResult:
 class ApplyReport:
     entries: list[ApplyEntryResult] = field(default_factory=list)
     rolled_back: bool = False
+    # path -> capped inline diff, rendered from the staged candidate
+    # at apply time (so accept-edited shows the bytes actually applied)
+    diffs: dict[str, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -354,6 +442,19 @@ class ApplyReport:
                 lines.append(f"  ✗ {e.path} — FAILED: {e.detail}")
         return lines
 
+    def section(self) -> str:
+        """The result-block files section: the outcome line per entry,
+        each followed by its inline diff — applied and rejected alike,
+        so the block shows the proposal exactly as rendered and what
+        happened to it."""
+        lines = ["files:"]
+        for entry, line in zip(self.entries, self.outcome_lines()):
+            lines.append(line)
+            diff = self.diffs.get(entry.path)
+            if diff:
+                lines.extend(f"    {ln}" for ln in diff.splitlines())
+        return "\n".join(lines)
+
 
 def apply_candidate(candidate: Candidate,
                     decision: DecisionRecord) -> ApplyReport:
@@ -364,6 +465,8 @@ def apply_candidate(candidate: Candidate,
     the applied hash is recomputed, never assumed from the manifest.
     """
     report = ApplyReport()
+    report.diffs = {e.path: render_diff(candidate, e)
+                    for e in candidate.entries}
     applied: list[CandidateEntry] = []
 
     for entry in candidate.entries:

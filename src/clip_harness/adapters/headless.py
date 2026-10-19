@@ -95,7 +95,7 @@ class TerminalDecider:
         self.out = out
 
     def __call__(self, candidate: Candidate) -> DecisionRecord | None:
-        self.out(candidate.summary())
+        self.out(candidate.presentation())
         try:
             answer = self.input_fn(
                 "[a]ccept / accept-[e]dited / [r]eject / "

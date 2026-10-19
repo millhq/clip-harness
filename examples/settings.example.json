@@ -1,0 +1,33 @@
+{
+  "timeout": 120,
+  "allowlist": ["git status", "git diff*", "ls *"],
+  "denylist": ["sudo *"],
+  "protected_paths": [".env", "~/.ssh"],
+  "hard_block_patterns": ["rm\\s+-rf\\s+/", ":\\(\\)\\{ :\\|:& \\};:"],
+  "mutation_gate": "review",
+  "tools": [
+    {
+      "name": "example.tool",
+      "description": "An example settings-declared capability.",
+      "shape": "declared in settings.json under \"tools\""
+    }
+  ],
+  "hooks": {
+    "PreRun": [
+      {"matcher": "Bash", "command": "python3 ~/.config/clip-harness/hooks/block_secrets.py", "timeout": 10}
+    ],
+    "PostRun": [
+      {"matcher": "*", "command": "python3 ~/.config/clip-harness/hooks/notify.py"},
+      {"matcher": "*", "command": "python3 ~/.config/clip-harness/hooks/audit_log.py"}
+    ],
+    "PostRunFailure": [
+      {"matcher": "*", "command": "python3 ~/.config/clip-harness/hooks/notify.py"}
+    ],
+    "ReviewDecision": [
+      {"matcher": "*", "command": "python3 ~/.config/clip-harness/hooks/notify.py"}
+    ],
+    "SessionEnd": [
+      {"matcher": "*", "command": "python3 ~/.config/clip-harness/hooks/notify.py"}
+    ]
+  }
+}

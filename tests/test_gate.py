@@ -1,0 +1,221 @@
+"""Gate tests: built-in policy ordering and the §7.3 candidate flow."""
+
+from pathlib import Path
+
+import pytest
+
+from clip_harness.core import Decision, FileSpec
+from clip_harness.gate import (DecisionRecord, apply_candidate,
+                               classify_and_stage, evaluate_policy)
+from clip_harness.settings import Settings
+
+
+def settings(**kwargs) -> Settings:
+    return Settings(**kwargs)
+
+
+# -- built-in policy ------------------------------------------------------
+
+def test_hard_block_beats_allowlist():
+    s = settings(allowlist=["rm *"], hard_block_patterns=[r"rm\s+-rf\s+/"])
+    verdict = evaluate_policy("rm -rf /", s)
+    assert verdict.hard_block is True
+    assert verdict.decision == Decision.DENY
+
+
+def test_denylist_denies():
+    verdict = evaluate_policy("sudo ls", settings(denylist=["sudo *"]))
+    assert verdict.decision == Decision.DENY
+
+
+def test_allowlist_miss_asks():
+    verdict = evaluate_policy("make test", settings(allowlist=["git *"]))
+    assert verdict.decision == Decision.ASK
+
+
+def test_allowlist_hit_allows():
+    verdict = evaluate_policy("git status", settings(allowlist=["git *"]))
+    assert verdict.decision == Decision.ALLOW
+
+
+def test_mutation_heuristic_asks_for_review():
+    verdict = evaluate_policy("cp a b", settings())
+    assert verdict.decision == Decision.ASK
+
+
+def test_readonly_command_allows_with_defaults():
+    verdict = evaluate_policy("ls -la", settings())
+    assert verdict.decision == Decision.ALLOW
+
+
+def test_mutation_gate_deny_setting():
+    verdict = evaluate_policy("touch x", settings(mutation_gate="deny"))
+    assert verdict.decision == Decision.DENY
+
+
+def test_protected_path_mutation_hard_blocks():
+    s = settings(protected_paths=[".env"])
+    verdict = evaluate_policy("cp .env .env.bak", s)
+    assert verdict.hard_block is True
+
+
+def test_protected_path_read_is_not_blocked():
+    s = settings(protected_paths=[".env"], allowlist=["cat *"])
+    verdict = evaluate_policy("cat .env", s)
+    assert verdict.hard_block is False
+
+
+# -- classification + staging ----------------------------------------------
+
+def _stage(tmp_path: Path, specs, workdir: Path):
+    return classify_and_stage(tmp_path / "cand", "r-1", None, specs, workdir)
+
+
+def test_classify_new_update_delete_nochange(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "exists.txt").write_text("old\n")
+    (work / "same.txt").write_text("same\n")
+    (work / "gone.txt").write_text("bye\n")
+    specs = [
+        FileSpec(path="new.txt", declared_op="create", content="fresh\n"),
+        FileSpec(path="exists.txt", declared_op="update", content="new\n"),
+        FileSpec(path="gone.txt", declared_op="delete", content=""),
+        FileSpec(path="same.txt", declared_op="update", content="same\n"),
+    ]
+    candidate = _stage(tmp_path, specs, work)
+    ops = {e.path: e.actual_op for e in candidate.entries}
+    assert ops == {"new.txt": "NEW", "exists.txt": "UPDATE",
+                   "gone.txt": "DELETE", "same.txt": "NO_CHANGE"}
+    # The no-op "update" is flagged: declared update, reality NO_CHANGE.
+    mismatches = {e.path for e in candidate.entries if e.mismatch}
+    assert mismatches == {"same.txt"}
+    # Staging never writes live files.
+    assert not (work / "new.txt").exists()
+    assert (work / "exists.txt").read_text() == "old\n"
+    assert (work / "gone.txt").exists()
+    assert "NEW" in candidate.summary()
+
+
+def test_declared_op_mismatch_is_flagged(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "real.txt").write_text("here\n")
+    specs = [FileSpec(path="real.txt", declared_op="create",
+                      content="changed\n"),
+             FileSpec(path="ghost.txt", declared_op="update",
+                      content="boo\n")]
+    candidate = _stage(tmp_path, specs, work)
+    by_path = {e.path: e for e in candidate.entries}
+    assert by_path["real.txt"].actual_op == "UPDATE"
+    assert by_path["real.txt"].mismatch is True
+    assert by_path["ghost.txt"].actual_op == "NEW"
+    assert by_path["ghost.txt"].mismatch is True
+
+
+def test_patch_staging_via_git(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "f.txt").write_text("a\nb\nc\n")
+    patch = ("--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n"
+             " a\n-b\n+B\n c\n")
+    specs = [FileSpec(path="f.txt", declared_op="auto", patch=patch)]
+    candidate = _stage(tmp_path, specs, work)
+    entry = candidate.entries[0]
+    assert entry.actual_op == "UPDATE"
+    staged = (candidate.dir / "candidates" / entry.candidate_file)
+    assert staged.read_text() == "a\nB\nc\n"
+    assert (work / "f.txt").read_text() == "a\nb\nc\n"  # live untouched
+
+
+def test_bad_patch_fails_closed(tmp_path):
+    from clip_harness.gate import GateError
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "f.txt").write_text("a\n")
+    patch = "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-zzz\n+yyy\n"
+    with pytest.raises(GateError):
+        _stage(tmp_path, [FileSpec(path="f.txt", patch=patch)], work)
+
+
+# -- apply -------------------------------------------------------------------
+
+def _accepted_all():
+    return DecisionRecord(decision="accept")
+
+
+def test_apply_writes_only_after_accept(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    candidate = _stage(tmp_path, [FileSpec(path="a.txt", content="A\n")],
+                       work)
+    report = apply_candidate(candidate, _accepted_all())
+    assert report.ok
+    assert (work / "a.txt").read_text() == "A\n"
+    assert report.entries[0].status == "applied"
+    assert "NEW" in report.outcome_lines()[0]
+
+
+def test_apply_per_file_acceptance(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    specs = [FileSpec(path="yes.txt", content="Y\n"),
+             FileSpec(path="no.txt", content="N\n")]
+    candidate = _stage(tmp_path, specs, work)
+    record = DecisionRecord(decision="accept", accepted_files=["yes.txt"])
+    report = apply_candidate(candidate, record)
+    assert (work / "yes.txt").exists()
+    assert not (work / "no.txt").exists()
+    statuses = {e.path: e.status for e in report.entries}
+    assert statuses == {"yes.txt": "applied", "no.txt": "rejected"}
+
+
+def test_apply_delete_and_nochange(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "d.txt").write_text("x\n")
+    (work / "s.txt").write_text("same\n")
+    specs = [FileSpec(path="d.txt", declared_op="delete", content=""),
+             FileSpec(path="s.txt", declared_op="update", content="same\n")]
+    candidate = _stage(tmp_path, specs, work)
+    report = apply_candidate(candidate, _accepted_all())
+    assert not (work / "d.txt").exists()
+    statuses = {e.path: e.status for e in report.entries}
+    assert statuses == {"d.txt": "applied", "s.txt": "skipped"}
+
+
+def test_accept_edited_applies_the_edited_candidate(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    candidate = _stage(tmp_path, [FileSpec(path="a.txt", content="v1\n")],
+                       work)
+    entry = candidate.entries[0]
+    staged = candidate.dir / "candidates" / entry.candidate_file
+    staged.write_text("v2 — edited in review\n")
+    report = apply_candidate(candidate,
+                             DecisionRecord(decision="accept-edited"))
+    assert (work / "a.txt").read_text() == "v2 — edited in review\n"
+    assert report.entries[0].reviewer_modified is True
+
+
+def test_base_moved_since_staging_fails_and_rolls_back(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "one.txt").write_text("one\n")
+    (work / "two.txt").write_text("two\n")
+    specs = [FileSpec(path="one.txt", declared_op="update",
+                      content="ONE\n"),
+             FileSpec(path="two.txt", declared_op="update",
+                      content="TWO\n")]
+    candidate = _stage(tmp_path, specs, work)
+    # The live tree moved under the candidate.
+    (work / "two.txt").write_text("two — edited elsewhere\n")
+    report = apply_candidate(candidate, _accepted_all())
+    assert report.ok is False
+    assert report.rolled_back is True
+    # First file was applied, then rolled back from its snapshot.
+    assert (work / "one.txt").read_text() == "one\n"
+    assert (work / "two.txt").read_text() == "two — edited elsewhere\n"
+    statuses = {e.path: e.status for e in report.entries}
+    assert statuses["one.txt"] == "rolled-back"
+    assert statuses["two.txt"] == "failed"

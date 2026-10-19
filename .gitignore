@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+# harness state, if a state dir is ever pointed into the repo
+receipts.jsonl
+.clipharness/

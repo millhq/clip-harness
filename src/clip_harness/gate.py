@@ -287,15 +287,25 @@ def _apply_patch(live: bytes | None, patch_text: str, rel_path: str) -> bytes:
 def classify_and_stage(candidate_dir: Path, run_id: str,
                        session_id: str | None,
                        specs: list[FileSpec], cwd: Path) -> Candidate:
-    """Stage every file spec as a candidate. Never writes live files."""
+    """Stage every file spec as a candidate. Never writes live files.
+
+    A spec whose resolved target escapes the working directory
+    (``../`` traversal, an absolute path elsewhere) is rejected —
+    GateError, fail closed — before anything is staged.
+    """
     candidate_dir.mkdir(parents=True, exist_ok=True)
     (candidate_dir / "candidates").mkdir(exist_ok=True)
     (candidate_dir / "snapshots").mkdir(exist_ok=True)
     candidate = Candidate(candidate_id=candidate_dir.name, run_id=run_id,
                           session_id=session_id, dir=candidate_dir)
+    cwd_root = cwd.resolve()
 
     for index, spec in enumerate(specs):
         abs_path = (cwd / spec.path).resolve()
+        if not abs_path.is_relative_to(cwd_root):
+            raise GateError(
+                f"file target escapes the working directory: "
+                f"{spec.path!r}")
         live = abs_path.read_bytes() if abs_path.is_file() else None
         base_hash = sha256_bytes(live) if live is not None else None
 

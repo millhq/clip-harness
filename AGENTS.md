@@ -16,9 +16,10 @@ Write every payload as one complete, copyable message.
 > Copying note (for the human): use the block's copy button freely.
 > If your chat UI strips the outer ``` fence when copying —
 > Microsoft 365 Copilot does — the harness still parses the block's
-> contents as the payload, keyed on the metadata header lines.
-> Models: emit the fenced form regardless. This is a copying
-> tolerance, not an alternative format.
+> contents as the payload: shell blocks keyed on the metadata header
+> lines, file/patch blocks on their `path:` header. Models: emit
+> the fenced form regardless. This is a copying tolerance, not an
+> alternative format.
 
 ## Your capabilities (the manifest)
 

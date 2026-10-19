@@ -50,6 +50,14 @@ not begin with a recognised metadata line is not an unfenced payload.
 Malformed metadata (a recognised key with an invalid value) fails
 closed — rejected, never executed as bare text.
 
+The same tolerance covers the mutation fences: text whose first line
+is an exact `path:` header parses as the file fence's contents when
+the next line is an explicit `op:` line (file.write REQUIRES an op in
+this form), or as the patch fence's contents when the body begins
+with a unified-diff header (`---` / `+++`). An invalid `op:` value,
+or a `path:` header followed by neither, fails closed — such text is
+never treated as bare shell text and never staged.
+
 Control triggers stay single-line, as in the original loop:
     ```cancel```  /  ```cancel id=<session>```
     ```rerun```    /  ```rerun id=<session>```
@@ -72,6 +80,7 @@ _HEADER_LINE = re.compile(
     re.IGNORECASE)
 _PATH_LINE = re.compile(r"^path\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _OP_LINE = re.compile(r"^op\s*:\s*(create|update|delete|auto)\s*$", re.IGNORECASE)
+_OP_ATTEMPT = re.compile(r"^op\s*:", re.IGNORECASE)
 _ATTR_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)=(.*)$")
 _ID_KEYS = {"id", "session"}
 
@@ -87,10 +96,12 @@ def looks_like_trigger(text: str) -> bool:
         return True
     if _FENCE_OPEN_COUNT.search(text) is not None:
         return True
-    # Unfenced form: a leading recognised metadata line is a payload
-    # attempt (its values are validated at parse time, fail-closed).
+    # Unfenced form: a leading recognised metadata line, or an exact
+    # `path:` header (the mutation fences' contents), is a payload
+    # attempt (validated at parse time, fail-closed).
     first_line = text.split("\n", 1)[0]
-    return _HEADER_LINE.match(first_line) is not None
+    return (_HEADER_LINE.match(first_line) is not None
+            or _PATH_LINE.match(first_line) is not None)
 
 
 def _parse_attrs(text: str) -> dict[str, str]:
@@ -215,6 +226,63 @@ def _parse_unfenced(text: str) -> Payload | None:
     return payload
 
 
+def _parse_unfenced_file(text: str) -> Payload | None:
+    """Parse the fence-stripped form of a file / patch payload.
+
+    The mutation fences' contents standing alone (what a fence-
+    stripping copy button leaves on the clipboard):
+
+        path: src/auth.py
+        op: update
+        <full file content>
+
+        path: src/tokens.py
+        --- a/src/tokens.py
+        +++ b/src/tokens.py
+        <unified diff>
+
+    Recognition is deliberately stricter than the fenced grammar, so
+    ordinary text that merely begins with `path:` cannot be
+    misclassified:
+
+    - line 1 must be an exact `path:` header (the same `_PATH_LINE`
+      grammar the fences use);
+    - a following `op:` line makes it a FILE payload, and file.write
+      REQUIRES that explicit op in this form — an `op:` line whose
+      value is not create/update/delete/auto is malformed;
+    - with no `op:` line, the body must begin with a unified-diff
+      header (first line starts `---`, second starts `+++`) to be a
+      PATCH payload. The op wins when both are present: a file whose
+      content is itself a diff is legitimate.
+
+    Returns None when line 1 is not a `path:` header. Once line 1
+    matches, every failure raises PayloadError — fail closed: the
+    text is never treated as bare shell text and never staged. The
+    FileSpec itself is built by `_parse_file_body`, so the runner's
+    staging/review/apply path cannot tell this payload was unfenced.
+    """
+    lines = text.split("\n")
+    if not lines or not _PATH_LINE.match(lines[0]):
+        return None
+    rest = lines[1:]
+    if rest and _OP_ATTEMPT.match(rest[0]):
+        if not _OP_LINE.match(rest[0]):
+            raise PayloadError(
+                f"unfenced file payload has an invalid 'op:' line: "
+                f"{rest[0].strip()!r} (expected create, update, "
+                f"delete or auto)")
+        spec = _parse_file_body("file", text)
+        return Payload(command="", kind="run", files=[spec], raw=text)
+    if len(rest) >= 2 and rest[0].startswith("---") \
+            and rest[1].startswith("+++"):
+        spec = _parse_file_body("patch", text)
+        return Payload(command="", kind="run", files=[spec], raw=text)
+    raise PayloadError(
+        "unfenced file/patch payload needs an 'op:' line (file) or "
+        "a unified diff beginning '---' / '+++' (patch) after the "
+        "'path:' line")
+
+
 def _parse_file_body(kind: str, body: str) -> FileSpec:
     lines = body.split("\n")
     # Tolerate leading blank lines before the path: header.
@@ -296,14 +364,18 @@ def parse_clipboard_text(text: str, *, allow_bare: bool = False) -> Payload | No
         1. ```shell fence (metadata header + commands)
         2. ```file / ```patch fences (mutation payloads)
         3. unfenced text beginning with a metadata header — the
-           fence's contents as copied by UIs that strip the fence
-           (Microsoft 365 Copilot's copy button)
-        4. bare clipboard text -> a single unbound command
+           shell fence's contents as copied by UIs that strip the
+           fence (Microsoft 365 Copilot's copy button)
+        4. unfenced text beginning with a `path:` header — the file
+           / patch fences' contents, under stricter rules (an
+           explicit `op:` line for a file, a diff header for a
+           patch; anything else fails closed)
+        5. bare clipboard text -> a single unbound command
 
     The fence/metadata layer is progressive enhancement over "whatever
     is on the clipboard runs" — never a requirement for the simple
-    case (Ali's hotkey-run tool already worked this way). Rungs 1–3
-    are payload forms: a fence or a metadata header is a deliberate
+    case (Ali's hotkey-run tool already worked this way). Rungs 1–4
+    are payload forms: a fence or a protocol header is a deliberate
     protocol act, accepted wherever payloads are. Bare text is only
     accepted when `allow_bare` is set: the explicit trigger path
     (the human hit the hotkey and ran the CLI) passes True; the passive
@@ -314,6 +386,8 @@ def parse_clipboard_text(text: str, *, allow_bare: bool = False) -> Payload | No
     if payload is not None:
         return payload
     payload = _parse_unfenced(text)
+    if payload is None:
+        payload = _parse_unfenced_file(text)
     if payload is not None or not allow_bare:
         return payload
     stripped = text.strip()

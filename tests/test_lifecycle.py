@@ -259,6 +259,155 @@ def test_unfenced_metadata_only_denied_nothing_runs(make_runner):
     assert executor.calls == []
 
 
+# -- unfenced mutation payloads (fence-stripped ```file / ```patch) ----------
+
+UNFENCED_FILE_CREATE = "path: src/new.py\nop: create\nprint('new')\n"
+
+
+def _manifest(runner, run_id):
+    path = runner.state_dir / "candidates" / run_id / "manifest.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_unfenced_file_stages_as_candidate_with_declared_op(
+        make_runner, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    runner = make_runner(decider=None)
+    outcome = runner.process_text(UNFENCED_FILE_CREATE, str(work))
+    assert outcome.state == RunState.PENDING_REVIEW
+    entry = _manifest(runner, outcome.run_id)["entries"][0]
+    assert entry["path"] == "src/new.py"
+    assert entry["declared_op"] == "create"
+    assert entry["actual_op"] == "NEW"
+    assert not (work / "src" / "new.py").exists()  # staged, not applied
+
+
+def test_unfenced_file_update_and_delete_stage(make_runner, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "a.txt").write_text("v1\n")
+    (work / "gone.txt").write_text("bye\n")
+    runner = make_runner(decider=None)
+    upd = runner.process_text("path: a.txt\nop: update\nv2\n", str(work))
+    entry = _manifest(runner, upd.run_id)["entries"][0]
+    assert entry["declared_op"] == "update"
+    assert entry["actual_op"] == "UPDATE"
+    dele = runner.process_text("path: gone.txt\nop: delete\n", str(work))
+    entry = _manifest(runner, dele.run_id)["entries"][0]
+    assert entry["declared_op"] == "delete"
+    assert entry["actual_op"] == "DELETE"
+    # Accepting the delete removes the file, like the fenced form.
+    done = runner.review_candidate(
+        dele.run_id, StaticDecider(DecisionRecord(decision="accept")))
+    assert done.state == RunState.COMPLETED
+    assert not (work / "gone.txt").exists()
+
+
+def test_unfenced_patch_stages_and_applies_on_review(
+        make_runner, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "a.txt").write_text("old\n")
+    runner = make_runner(decider=None)
+    outcome = runner.process_text(
+        "path: a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        str(work))
+    assert outcome.state == RunState.PENDING_REVIEW
+    entry = _manifest(runner, outcome.run_id)["entries"][0]
+    assert entry["actual_op"] == "UPDATE"
+    done = runner.review_candidate(
+        outcome.run_id, StaticDecider(DecisionRecord(decision="accept")))
+    assert done.state == RunState.COMPLETED
+    assert (work / "a.txt").read_text() == "new\n"
+
+
+def test_unfenced_candidate_accept_applies(make_runner, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    runner = make_runner(decider=None)
+    outcome = runner.process_text(UNFENCED_FILE_CREATE, str(work))
+    done = runner.review_candidate(
+        outcome.run_id, StaticDecider(DecisionRecord(decision="accept")))
+    assert done.state == RunState.COMPLETED
+    assert (work / "src" / "new.py").read_text() == "print('new')\n"
+    assert "✓ src/new.py — NEW" in done.result_block
+
+
+def test_unfenced_candidate_accept_edited(make_runner, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    runner = make_runner(decider=None)
+    outcome = runner.process_text(UNFENCED_FILE_CREATE, str(work))
+    staged = (runner.state_dir / "candidates" / outcome.run_id
+              / "candidates" / "0")
+    staged.write_text("print('edited')\n", encoding="utf-8")
+    done = runner.review_candidate(
+        outcome.run_id,
+        StaticDecider(DecisionRecord(decision="accept-edited")))
+    assert done.state == RunState.COMPLETED
+    assert (work / "src" / "new.py").read_text() == "print('edited')\n"
+    assert "(edited in review)" in done.result_block
+
+
+def test_unfenced_candidate_reject_writes_nothing(make_runner, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    runner = make_runner(decider=None)
+    outcome = runner.process_text(UNFENCED_FILE_CREATE, str(work))
+    done = runner.review_candidate(
+        outcome.run_id,
+        StaticDecider(DecisionRecord(decision="reject",
+                                     reason="wrong layer")))
+    assert done.state == RunState.REJECTED
+    assert not (work / "src" / "new.py").exists()
+
+
+def test_unfenced_candidate_stale_preimage_fails_and_rolls_back(
+        make_runner, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "a.txt").write_text("v1\n")
+    runner = make_runner(decider=None)
+    outcome = runner.process_text("path: a.txt\nop: update\nv2\n",
+                                  str(work))
+    assert outcome.state == RunState.PENDING_REVIEW
+    # The live file moves after staging: the base hash no longer
+    # matches, so apply must fail and leave the live bytes alone.
+    (work / "a.txt").write_text("v1 — edited elsewhere\n")
+    done = runner.review_candidate(
+        outcome.run_id, StaticDecider(DecisionRecord(decision="accept")))
+    assert done.state == RunState.FAILED
+    assert (work / "a.txt").read_text() == "v1 — edited elsewhere\n"
+
+
+def test_unfenced_malformed_file_never_reaches_shell(
+        make_runner, clipboard):
+    executor = FakeExecutor()
+    runner = make_runner(executor=executor)
+    for text in ("path: a.txt\nop: bogus\necho pwned\n",
+                 "path: a.txt\nplain body, no op, no diff\n"):
+        outcome = runner.process_text(text, "/tmp", allow_bare=True)
+        assert outcome.state == RunState.DENIED
+        assert clipboard.text.startswith(
+            "⛔ clip-harness: malformed payload")
+    assert executor.calls == []
+
+
+def test_traversal_rejected_for_fenced_and_unfenced_alike(
+        make_runner, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    runner = make_runner(decider=None)
+    for text in ("```file\npath: ../escape.txt\nop: create\nx\n```",
+                 "path: ../escape.txt\nop: create\nx\n"):
+        outcome = runner.process_text(text, str(work))
+        assert outcome.state == RunState.FAILED
+        assert "candidate staging failed" in outcome.message
+        assert "escapes the working directory" in outcome.message
+    assert not (tmp_path / "escape.txt").exists()
+
+
 # -- gate behavior through the runner ----------------------------------------------
 
 def test_builtin_hard_block_denies(make_runner):

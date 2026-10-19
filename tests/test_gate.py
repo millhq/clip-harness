@@ -138,6 +138,20 @@ def test_bad_patch_fails_closed(tmp_path):
         _stage(tmp_path, [FileSpec(path="f.txt", patch=patch)], work)
 
 
+def test_traversal_target_rejected_at_staging(tmp_path):
+    from clip_harness.gate import GateError
+    work = tmp_path / "work"
+    work.mkdir()
+    for path in ("../escape.txt", "sub/../../escape.txt",
+                 str(tmp_path / "absolute.txt")):
+        with pytest.raises(GateError):
+            _stage(tmp_path, [FileSpec(path=path, declared_op="create",
+                                       content="x\n")], work)
+    # Nothing staged, nothing written outside the workdir.
+    assert not (tmp_path / "escape.txt").exists()
+    assert not (tmp_path / "absolute.txt").exists()
+
+
 # -- apply -------------------------------------------------------------------
 
 def _accepted_all():

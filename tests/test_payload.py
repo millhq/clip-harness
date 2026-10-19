@@ -274,3 +274,114 @@ def test_fenced_form_unchanged_by_unfenced_rung():
     assert payload.session_id == "s1"
     assert payload.timeout == 30.0
     assert payload.command == "echo fenced"
+
+
+# -- the unfenced mutation form (fence-stripped ```file / ```patch) -----
+#
+# The same copy buttons strip the mutation fences too. The contents
+# parse as the same FileSpec the fenced parser would build — under
+# stricter recognition rules, and every ambiguity fails closed.
+
+UNFENCED_FILE_CREATE = "path: src/new.py\nop: create\nprint('new')\n"
+UNFENCED_PATCH = ("path: src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n"
+                  "@@ -1 +1 @@\n-old\n+new\n")
+
+
+def test_unfenced_file_create():
+    payload = parse_clipboard_text(UNFENCED_FILE_CREATE, allow_bare=True)
+    assert payload.pure_mutation is True
+    assert payload.command == ""
+    spec = payload.files[0]
+    assert spec.path == "src/new.py"
+    assert spec.declared_op == "create"
+    assert spec.content == "print('new')\n"
+    assert spec.is_patch is False
+
+
+def test_unfenced_file_is_a_payload_form_not_bare_text():
+    # Recognised on the watch path too (allow_bare=False).
+    payload = parse_clipboard_text(UNFENCED_FILE_CREATE, allow_bare=False)
+    assert payload is not None and payload.pure_mutation is True
+
+
+def test_unfenced_file_update_and_delete():
+    payload = parse_clipboard_text(
+        "path: a.txt\nop: update\nv2\n", allow_bare=True)
+    assert payload.files[0].declared_op == "update"
+    assert payload.files[0].content == "v2\n"
+    payload = parse_clipboard_text(
+        "path: a.txt\nop: delete\n", allow_bare=True)
+    assert payload.files[0].declared_op == "delete"
+    assert payload.files[0].content == ""
+
+
+def test_unfenced_patch():
+    payload = parse_clipboard_text(UNFENCED_PATCH, allow_bare=True)
+    spec = payload.files[0]
+    assert spec.is_patch is True
+    assert spec.path == "src/a.py"
+    assert "-old" in spec.patch and "+new" in spec.patch
+
+
+def test_unfenced_file_missing_op_fails_closed():
+    # Plain content after `path:` with no op: line is NOT a file
+    # payload — and must never degrade into a bare shell command.
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("path: notes.txt\njust some prose\n",
+                             allow_bare=True)
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("path: notes.txt\njust some prose\n",
+                             allow_bare=False)
+
+
+def test_unfenced_file_invalid_op_fails_closed():
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("path: a.txt\nop: frobnicate\nbody\n",
+                             allow_bare=True)
+
+
+def test_unfenced_invalid_diff_header_fails_closed():
+    # `path:` then a body that is neither op:-headed nor a real
+    # unified diff (second line is not `+++`).
+    with pytest.raises(PayloadError):
+        parse_clipboard_text(
+            "path: a.py\n--- a/a.py\n-- not a plus header\n-old\n",
+            allow_bare=True)
+    # `path:` alone, nothing after it.
+    with pytest.raises(PayloadError):
+        parse_clipboard_text("path: a.py", allow_bare=True)
+
+
+def test_unfenced_op_wins_over_diff_body():
+    # Precedence: an explicit op: line means file.write, even when
+    # the content is itself a diff.
+    payload = parse_clipboard_text(
+        "path: change.patch\nop: create\n"
+        "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
+        allow_bare=True)
+    spec = payload.files[0]
+    assert spec.is_patch is False
+    assert spec.declared_op == "create"
+    assert spec.content.startswith("--- a/x")
+
+
+def test_unfenced_file_content_is_verbatim():
+    text = ("path: doc.md\nop: create\n# Title\n\n"
+            "path: not a header inside content\n- a list\n")
+    payload = parse_clipboard_text(text, allow_bare=True)
+    assert payload.files[0].content == (
+        "# Title\n\npath: not a header inside content\n- a list\n")
+
+
+def test_path_line_after_shell_body_is_shell_text():
+    # `path:` appearing after a shell body has begun is ordinary
+    # shell text, never a file payload.
+    payload = parse_clipboard_text(
+        "session: s1\necho one\npath: not-a-file\necho two",
+        allow_bare=True)
+    assert payload.command == "echo one\npath: not-a-file\necho two"
+    assert payload.files == []
+    fenced = parse_payload(
+        "```shell\necho one\npath: not-a-file\n```")
+    assert fenced.command == "echo one\npath: not-a-file"
+    assert fenced.files == []

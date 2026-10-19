@@ -122,7 +122,10 @@ requirement for the simple case:
 3. **Unfenced contents beginning with a metadata header** — the
    shell fence's contents standing alone, when the fence was lost
    in copying (see "When the fence is lost in copying", below).
-4. **Bare clipboard text** — treated as a single unbound command
+4. **Unfenced contents beginning with a `path:` header** — the
+   ```file / ```patch fences' contents standing alone, under
+   stricter recognition rules (same section, below).
+5. **Bare clipboard text** — treated as a single unbound command
    (only on the explicit trigger path; the passive `watch` loop never
    auto-runs bare text).
 
@@ -169,10 +172,22 @@ metadata and never passed to the shell; the remaining lines are the
 command, and goal/task `action:` payloads work identically. Bound
 runs get the same manifest and sticky footer as fenced runs.
 
+The mutation fences get the same tolerance, under stricter rules.
+Text whose first line is an exact `path:` header is the ```file or
+```patch fence's contents when what follows disambiguates it: an
+explicit `op:` line (`create` / `update` / `delete` / `auto`) makes
+it a file payload — file.write **requires** that op in this form —
+and a body beginning with a unified-diff header (`---` then `+++`)
+makes it a patch payload. (The op wins if both are present: a file
+whose content is itself a diff is legitimate.) The payload then
+flows through the identical staging, review and apply path as a
+fenced one — same manifest, same base-hash checks, same
+traversal rejection at staging.
+
 This is a tolerance for a copying artifact, not a second format:
 
 - Text that does not begin with a recognised metadata line is not
-  an unfenced payload — it is bare text (rung 4), as before. An
+  an unfenced payload — it is bare text (rung 5), as before. An
   unrecognised first line (e.g. `foo: bar`) starts no header.
 - A recognised key with an invalid value inside the header
   (`timeout: soon`, `attend: maybe`) is malformed metadata: the
@@ -180,8 +195,12 @@ This is a tolerance for a copying artifact, not a second format:
   to running the header as shell text.
 - A metadata line appearing after the command body has begun is
   ordinary shell text, never re-parsed.
-- Metadata with no command body is rejected. File and patch fences
-  have no unfenced form.
+- Metadata with no command body is rejected.
+- A `path:` header followed by neither a valid `op:` line nor a
+  diff header is malformed: rejected, never treated as bare shell
+  text, never staged. An `op:` line with any other value is
+  malformed the same way. A `path:` line appearing after a shell
+  body has begun is ordinary shell text.
 
 ### Execution modes
 

@@ -1208,6 +1208,46 @@ def case_47(env: Env):
           "receipt does not record the full output size")
 
 
+def case_48(env: Env):
+    # M365's copy button strips the ```file / ```patch fences too:
+    # the fence contents standing alone stage as the same candidate
+    # a fenced payload would, and review applies them identically.
+    cid = _stage(env, "path: loose.txt\nop: create\nfence-free\n")
+    entry = env.manifest(cid)["entries"][0]
+    check(entry["declared_op"] == "create"
+          and entry["actual_op"] == "NEW",
+          f"unfenced file staged wrong: {entry}")
+    proc = env.cli("candidate", "review", cid, "--decision", "accept")
+    check(proc.returncode == 0, proc.stderr)
+    check((env.proj / "loose.txt").read_text() == "fence-free\n",
+          "unfenced file was not applied on accept")
+    check("✓ loose.txt — NEW" in env.clip_text(),
+          f"NEW tag missing for unfenced file: {env.clip_text()!r}")
+    # Unfenced patch on the now-live file.
+    cid = _stage(env,
+                 "path: loose.txt\n--- a/loose.txt\n+++ b/loose.txt\n"
+                 "@@ -1 +1 @@\n-fence-free\n+patched\n")
+    proc = env.cli("candidate", "review", cid, "--decision", "accept")
+    check(proc.returncode == 0, proc.stderr)
+    check((env.proj / "loose.txt").read_text() == "patched\n",
+          "unfenced patch was not applied on accept")
+    # Fail closed: `path:` with neither an op: line nor a diff header
+    # is a malformed payload — rejected, never run as bare shell.
+    proc = env.run_payload("path: nope.txt\njust prose, no op\n")
+    check(proc.returncode == 0, proc.stderr)
+    check(env.clip_text().startswith("⛔ clip-harness: malformed payload"),
+          f"ambiguous unfenced file not rejected: {env.clip_text()!r}")
+    check(not (env.proj / "nope.txt").exists(),
+          "rejected unfenced payload wrote a file")
+    # Traversal is rejected at staging for the unfenced form too.
+    proc = env.run_payload("path: ../escape.txt\nop: create\nx\n")
+    check(proc.returncode == 0, proc.stderr)
+    check("candidate staging failed" in env.clip_text(),
+          f"unfenced traversal not rejected: {env.clip_text()!r}")
+    check(not (env.root / "escape.txt").exists(),
+          "unfenced traversal wrote outside the project")
+
+
 # =======================================================================
 # Matrix runner
 # =======================================================================

@@ -322,17 +322,31 @@ def case_09(env: Env):
 
 
 def case_10(env: Env):
-    env.write_file("gen.py", "print('x' * 200000)\n")
+    # 12,000 lines x 20 chars = 240,000 chars of output: past the
+    # default 100k result budget, so the block carries a head + tail
+    # digest around the elision marker while the spill file keeps the
+    # full output byte-for-byte.
+    env.write_file("gen.py",
+                   "for i in range(12000):\n"
+                   "    print(f'row {i:05d} ' + 'x' * 9)\n")
     proc = env.run_payload("```shell\npython3 gen.py\n```", timeout=60)
     check(proc.returncode == 0, proc.stderr)
     block = env.clip_text()
-    match = re.search(r"full output in (\S+?)\]", block)
-    check(match, f"no spill pointer in block: {block[:200]!r}")
-    check("truncated at 128k" in block, "block not marked truncated")
-    spilled = Path(match.group(1))
-    check(spilled.exists() and spilled.stat().st_size > 200000,
-          "full output not in the spill file")
-    check(len(block) < 150000, "result block itself was not capped")
+    match = re.search(
+        r"\[output elided: (\d+) of (\d+) chars shown · "
+        r"full output \(\d+ chars\) saved at (\S+)", block)
+    check(match, f"no elision marker in block: {block[:200]!r}")
+    shown, total = int(match.group(1)), int(match.group(2))
+    check(total == 240000, f"marker total wrong: {total}")
+    check(0 < shown < 100000, f"marker shown wrong: {shown}")
+    spilled = Path(match.group(3))
+    check(spilled.exists() and spilled.stat().st_size == 240000,
+          "full output not preserved in the spill file")
+    check("row 00000" in block and "row 11999" in block,
+          "digest is missing the head or the tail")
+    check("row 06000" not in block, "elided middle leaked into the block")
+    check(len(block) < 110000,
+          "result block not bounded near the default budget")
 
 
 # =======================================================================
@@ -1160,6 +1174,38 @@ def case_46(env: Env):
           f"malformed run not receipted as rejected: {rejected}")
     check(env.events("PostRun", run_id=rejected["run_id"]) == [],
           "malformed unfenced payload produced a PostRun")
+
+
+def case_47(env: Env):
+    # result_budget_chars is a setting, not a constant: a 2k budget
+    # elides a 12k output to a digest near 2k, the full output still
+    # lands in the run's spill file, and the receipt records it.
+    env.write_settings({"result_budget_chars": 2000})
+    env.write_file("gen2.py",
+                   "for i in range(600):\n"
+                   "    print(f'row {i:05d} ' + 'x' * 9)\n")
+    proc = env.run_payload("```shell\npython3 gen2.py\n```", timeout=60)
+    check(proc.returncode == 0, proc.stderr)
+    block = env.clip_text()
+    match = re.search(
+        r"\[output elided: (\d+) of 12000 chars shown · "
+        r"full output \(12000 chars\) saved at (\S+)", block)
+    check(match, f"no elision marker in block: {block[:200]!r}")
+    shown = int(match.group(1))
+    check(0 < shown < 2000, f"shown count ignores the budget: {shown}")
+    check(len(block) < 3000,
+          f"block not bounded near the custom budget: {len(block)}")
+    check("row 00000" in block and "row 00599" in block,
+          "digest is missing the head or the tail")
+    check("row 00300" not in block, "elided middle leaked into the block")
+    spilled = Path(match.group(2))
+    check(spilled.exists() and spilled.stat().st_size == 12000,
+          "full output not preserved in the spill file")
+    posts = env.events("PostRun")
+    check(posts and posts[-1]["data"].get("output_elided") is True,
+          f"receipt does not record the elision: {posts[-1:]!r}")
+    check(posts[-1]["data"].get("output_chars") == 12000,
+          "receipt does not record the full output size")
 
 
 # =======================================================================

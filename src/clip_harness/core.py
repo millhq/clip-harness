@@ -15,7 +15,14 @@ from enum import Enum
 
 # --- Limits (carried over from the original clipboard_loop.py) ---------------
 
-MAX_CLIP_OUTPUT = 128_000  # chars; clipboard results are capped at 128k
+MAX_CLIP_OUTPUT = 128_000  # chars; cap for the transcript's copy of output
+# Default result-block budget: the OUTPUT portion of a ```result block is
+# elided (head + tail digest) beyond this many chars. 100k leaves room in
+# a 128k-capped chat message (Microsoft 365 Copilot's per-message limit)
+# for the human's own words plus the block's command echo, footer and
+# manifest. It is a default for the `result_budget_chars` SETTING — the
+# limit belongs to the receiving surface, not to the protocol.
+DEFAULT_RESULT_BUDGET_CHARS = 100_000
 MAX_PAYLOAD_CHARS = 32_768  # refuse absurdly long payloads (hotkey-run guard)
 DEFAULT_TIMEOUT = 120  # per-command timeout, seconds
 DEFAULT_HOOK_TIMEOUT = 30  # per-hook timeout, seconds
@@ -194,17 +201,139 @@ class RunContext:
         return self.payload.session_id
 
 
+# --- Oversized output: preserve everything, paste a digest -------------------
+#
+# The full output always survives byte-for-byte in the run's output file
+# (the executor's spill file, runs/<run_id>/output.txt). What goes into
+# the result block is a digest: past the budget, the middle is elided and
+# replaced by ONE marker line that names the file and teaches the model
+# how to page it (sed/grep/tail through ordinary shell commands — no new
+# protocol surface). The bulk therefore never occupies the chat model's
+# context, yet nothing is ever lost: the rest stays addressable.
+
+
+@dataclass
+class Elision:
+    """The outcome of eliding one output to an allowance."""
+
+    text: str  # the output itself, or head + marker + tail
+    elided: bool
+    shown_chars: int  # chars of the ORIGINAL output present in text
+    total_chars: int  # len of the original output
+
+
+def _elide_marker(shown: int, total: int, elided: int, output_file: str,
+                  first_line: int, last_line: int) -> str:
+    pointer = output_file or "the run output file"
+    page_end = min(last_line, first_line + 99)
+    return (
+        f"[output elided: {shown} of {total} chars shown · "
+        f"full output ({total} chars) saved at {pointer} · "
+        f"page it with: sed -n '{first_line},{page_end}p' {pointer} · "
+        f"grep {pointer} · tail -c {elided} {pointer}]"
+    )
+
+
+def _digest_cuts(output: str, content: int) -> tuple[str, str]:
+    """Split `output` into (head, tail) totalling `content` chars.
+
+    The shares are equal, head taking the odd char. Cuts prefer line
+    boundaries: the head ends at the last newline in its share when that
+    wastes at most half the share (no partial line is shown), and the
+    tail starts just after the first newline in its share's first half.
+    With no usable boundary the cut is a hard char cut.
+    """
+    total = len(output)
+    head_share = (content + 1) // 2
+    tail_share = content // 2
+    head_end = head_share
+    newline = output.rfind("\n", 0, head_share)
+    if newline >= head_share // 2:
+        head_end = newline  # the newline itself is not shown either
+    tail_start = total - tail_share
+    newline = output.find("\n", tail_start, tail_start + tail_share // 2)
+    if newline != -1:
+        tail_start = newline + 1
+    if head_end >= tail_start:  # cannot happen (shares sum < total)
+        head_end, tail_start = head_share, total - tail_share
+    return output[:head_end], output[tail_start:]
+
+
+def _line_range(output: str, head: str, tail: str) -> tuple[int, int]:
+    """1-based (first, last) line numbers touched by the elided middle —
+    the sed paging hint in the marker. Exact at line-boundary cuts."""
+    first = output.count("\n", 0, len(head)) + 1
+    last = output.count("\n", 0, len(output) - len(tail)) + 1
+    last = min(last, output.count("\n") + 1)
+    return first, max(first, last)
+
+
+def elide_output(output: str, allowance: int,
+                 output_file: str = "") -> Elision:
+    """Elide `output` to at most `allowance` chars (see the section
+    header above). Output within the allowance is returned untouched.
+
+    The marker's length depends on the shown count, which depends on
+    the space the marker leaves — so the marker's width is reserved at
+    its worst case (every number as wide as the total) before cutting;
+    the real marker is never wider, and the assembled digest never
+    exceeds the allowance. Char counts in the marker are exact:
+    shown = head chars + tail chars, total = the full output length.
+    """
+    total = len(output)
+    if total <= allowance:
+        return Elision(output, False, total, total)
+    worst = _elide_marker(total, total, total, output_file, total, total)
+    content = allowance - len(worst) - 2  # the two "\n" around the marker
+    if content < 0:
+        # Pathological budget: the marker alone busts the allowance.
+        # The marker IS the digest — it stays whole and exact.
+        marker = _elide_marker(0, total, total, output_file, 1,
+                               output.count("\n") + 1)
+        return Elision(marker, True, 0, total)
+    head, tail = _digest_cuts(output, content)
+
+    def assemble(head: str, tail: str) -> tuple[str, str]:
+        shown = len(head) + len(tail)
+        first, last = _line_range(output, head, tail)
+        marker = _elide_marker(shown, total, total - shown, output_file,
+                               first, last)
+        if not head and not tail:
+            return marker, marker
+        body = head + "\n" + marker + ("\n" + tail if tail else "")
+        return body, marker
+
+    text, marker = assemble(head, tail)
+    if len(text) > allowance:
+        # Freak digit-width case (a line count wider than the char
+        # total it was reserved against): shave the excess off the
+        # head's end, then the tail's start, and rebuild once — a
+        # smaller shown count never widens the marker.
+        excess = len(text) - allowance
+        cut = min(excess, len(head))
+        head, excess = head[:len(head) - cut], excess - cut
+        if excess:
+            tail = tail[excess:]
+        text, marker = assemble(head, tail)
+    return Elision(text, True, len(head) + len(tail), total)
+
+
 # --- Result formatting (format inherited from clipboard_loop.py) --------------
 
 
 def format_result(command: str, output: str, exit_desc: str, elapsed: float,
                   output_file: str = "", *, files_section: str = "",
                   standing_section: str = "",
-                  extra_section: str = "") -> str:
+                  extra_section: str = "",
+                  budget: int | None = None) -> str:
     """The ```result block that goes back on the clipboard.
 
-    Output is capped at MAX_CLIP_OUTPUT chars; beyond that the block is
-    truncated with a pointer to the file holding the full output.
+    The output portion is bounded by `budget` chars (the
+    `result_budget_chars` setting; DEFAULT_RESULT_BUDGET_CHARS when not
+    passed): beyond it the output is elided to a head + tail digest
+    around the elision marker, and the full output stays in
+    `output_file`. The command echo and the sections below are not part
+    of the budget — they stay whole.
 
     Optional sections, appended inside the fence after the exit line:
     `files_section` (the applied/rejected file outcome), then
@@ -215,12 +344,9 @@ def format_result(command: str, output: str, exit_desc: str, elapsed: float,
     position — it is always the final section of a bound block.
     """
     body = output if output else "(no output)"
-    if len(body) > MAX_CLIP_OUTPUT:
-        pointer = output_file or "the run output file"
-        body = (
-            body[:MAX_CLIP_OUTPUT]
-            + f"\n…[truncated at 128k chars, full output in {pointer}]"
-        )
+    if output:
+        limit = DEFAULT_RESULT_BUDGET_CHARS if budget is None else budget
+        body = elide_output(output, limit, output_file).text
     block = f"```result\n$ {command}\n{body}\n[exit {exit_desc} · {elapsed:.1f}s]"
     for section in (files_section, extra_section, standing_section):
         if section:
@@ -229,11 +355,6 @@ def format_result(command: str, output: str, exit_desc: str, elapsed: float,
 
 
 def cap_output(output: str, output_file: str = "") -> tuple[str, bool]:
-    """Return (possibly-truncated output, was_truncated) for receipts."""
-    if len(output) <= MAX_CLIP_OUTPUT:
-        return output, False
-    pointer = output_file or "the run output file"
-    return (
-        output[:MAX_CLIP_OUTPUT]
-        + f"\n…[truncated at 128k chars, full output in {pointer}]"
-    ), True
+    """Return (possibly-elided output, was_elided) for the transcript."""
+    result = elide_output(output, MAX_CLIP_OUTPUT, output_file)
+    return result.text, result.elided

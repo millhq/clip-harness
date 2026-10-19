@@ -24,7 +24,9 @@ Write every payload as one complete, copyable message.
 
 These are the tools you may invoke, and the block shape for each:
 
-- **shell.run** — run shell commands.
+- **shell.run** — run shell commands. Oversized output is elided
+  in the result block; the block names the file holding the full
+  output — page it, don't re-run.
   Shape: a ```shell fence (see below).
 - **file.write** — propose a full-file create/update/delete. Staged
   and applied only after the human reviews it.

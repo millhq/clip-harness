@@ -242,7 +242,7 @@ Single-line, as in the original loop: `` ```cancel``` `` /
 ````
 ```result
 $ npm test
-<output, capped at 128k — full output spilled to a file on disk>
+<output — oversized output elided to a head + tail digest; the full output stays in a file on disk>
 [exit 0 · 3.2s]
 files:
   ✓ src/auth.py — UPDATED
@@ -283,6 +283,23 @@ version and no separate machine version.
 - A rejection puts plain rejection text on the clipboard instead
   (the rejected diffs included, marked rejected, with the reason),
   ready to paste back so the model can re-propose.
+
+### Oversized output
+
+A command's full output is always preserved byte-for-byte at
+`<state_dir>/runs/<run_id>/output.txt`. What goes into the result
+block is bounded by the `result_budget_chars` setting (default
+100,000): output past the budget is elided to a head + tail digest
+around one marker line —
+
+`[output elided: N of T chars shown · full output (T chars) saved at <path> · page it with: sed -n 'A,Bp' <path> · grep <path> · tail -c E <path>]`
+
+The default leaves room inside a 128k-capped chat message (Microsoft
+365 Copilot's per-message limit) for your own words and the block's
+footer; set the budget for whatever surface you paste into. Nothing
+is lost and no re-run is needed: the model pages the stored file with
+ordinary shell commands in a follow-up payload, so the bulk never
+occupies its context — it stays addressable instead.
 
 ## Goal/task state (core)
 
@@ -407,6 +424,7 @@ project. See [examples/settings.example.json](examples/settings.example.json).
   "protected_paths": [".env", "~/.ssh"],
   "hard_block_patterns": ["rm\\s+-rf\\s+/"],
   "mutation_gate": "review",
+  "result_budget_chars": 100000,
   "color": "auto",
   "hooks": {
     "PreRun": [{"matcher": "Bash", "command": "~/hooks/check.py", "timeout": 10}],
@@ -467,8 +485,9 @@ lifecycle this way.
 - The passive watch loop **never auto-runs bare text** — bare-text
   execution requires the explicit trigger (the human's hotkey), the
   same trust model as a terminal.
-- Payloads are capped (32k chars); result blocks are capped at 128k
-  with the full output spilled to a file on disk.
+- Payloads are capped (32k chars); result blocks elide output past
+  `result_budget_chars` (default 100k) to a head + tail digest, with
+  the full output preserved byte-for-byte in the run's output file.
 - Hooks are *your* commands running with *your* privileges — the
   settings file is a trust boundary, like Claude Code's.
 

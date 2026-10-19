@@ -17,6 +17,9 @@ Settings schema (all fields optional):
   "protected_paths": [".env", "*.key", "~/.ssh"],
   "hard_block_patterns": ["rm -rf /", ":(){ :|:& };:"],
   "mutation_gate": "review",         // review | allow | deny
+  "result_budget_chars": 100000,     // output chars per result block
+                                     // before head+tail elision (the
+                                     // full output is kept on disk)
   "color": "auto",                   // auto | always | never — terminal
                                      // diff colors (rendering only;
                                      // NO_COLOR env also forces off)
@@ -39,7 +42,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .core import DEFAULT_HOOK_TIMEOUT, DEFAULT_TIMEOUT
+from .core import (DEFAULT_HOOK_TIMEOUT, DEFAULT_RESULT_BUDGET_CHARS,
+                    DEFAULT_TIMEOUT)
 
 USER_SETTINGS = Path("~/.config/clip-harness/settings.json")
 PROJECT_SETTINGS = Path(".clip-harness/settings.json")
@@ -72,6 +76,12 @@ class Settings:
     protected_paths: list[str] = field(default_factory=list)
     hard_block_patterns: list[str] = field(default_factory=list)
     mutation_gate: str = "review"  # review | allow | deny
+    # Presentation only: how much command output a result block carries
+    # before head+tail elision (the full output is always preserved in
+    # the run's output file). Sized for the receiving surface — the
+    # default leaves room inside a 128k-capped chat message. Never part
+    # of the gate config hash, like color: it cannot change what runs.
+    result_budget_chars: int = DEFAULT_RESULT_BUDGET_CHARS
     # Rendering only (terminal diff colors); never part of the gate
     # config hash — a color change is not a ConfigChange.
     color: str = "auto"  # auto | always | never
@@ -111,6 +121,21 @@ class Settings:
         return hashlib.sha256(blob.encode()).hexdigest()
 
 
+def _positive_int(value: object) -> int | None:
+    """Parse a positive int from a settings value; None when unusable
+    (absent, non-numeric, zero/negative, a bool) — the caller then keeps
+    the current/default value. Fail safe, never crash, on bad config."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
 def _load_json(path: Path) -> dict | None:
     try:
         with open(path) as f:
@@ -128,6 +153,9 @@ def _merge(base: Settings, data: dict, source: str) -> None:
         base.timeout = float(data["timeout"])
     if "mutation_gate" in data:
         base.mutation_gate = str(data["mutation_gate"])
+    budget = _positive_int(data.get("result_budget_chars"))
+    if budget is not None:
+        base.result_budget_chars = budget
     color = data.get("color")
     if isinstance(color, str) and color.lower() in ("auto", "always",
                                                     "never"):

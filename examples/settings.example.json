@@ -5,6 +5,7 @@
   "protected_paths": [".env", "~/.ssh"],
   "hard_block_patterns": ["rm\\s+-rf\\s+/", ":\\(\\)\\{ :\\|:& \\};:"],
   "mutation_gate": "review",
+  "result_budget_chars": 100000,
   "color": "auto",
   "tools": [
     {

@@ -38,8 +38,8 @@ from typing import Callable
 from . import gate as gate_mod
 from . import hooks as hooks_mod
 from .core import (MAX_PAYLOAD_CHARS, Decision, Event, GateVerdict, Payload,
-                   RunContext, RunState, cap_output, format_result,
-                   new_run_id, now_iso, sha256_text)
+                   RunContext, RunState, cap_output, elide_output,
+                   format_result, new_run_id, now_iso, sha256_text)
 from .executor import Executor, LocalExecutor
 from .goals import GoalStore
 from .manifest import ManifestStore
@@ -553,7 +553,8 @@ class LifecycleRunner:
         block = format_result(ctx.command_executed, output, "0", 0.0, "",
                               standing_section=store.section(),
                               extra_section=self._extra_section(
-                                  ctx, outcome))
+                                  ctx, outcome),
+                              budget=self.settings.result_budget_chars)
         self._save_result(run_id, block)
         self._set_clipboard(block)
         self.registry.set_state(handle, RunState.COMPLETED.value)
@@ -611,12 +612,17 @@ class LifecycleRunner:
             display_output = outcome.updated_tool_output
             rewritten = True
 
+        elision = elide_output(display_output,
+                               self.settings.result_budget_chars,
+                               handle.output_file)
         # Receipt BEFORE the clipboard is overwritten (§6 ordering rule).
         self.ledger.append(run_id, event.value,
                            {"status": status, "tool_name": "Bash",
                             "tool_input": {"command": command},
                             "tool_response": tool_response,
                             "duration_ms": duration_ms,
+                            "output_chars": len(display_output),
+                            "output_elided": elision.elided,
                             **({"output_rewritten_by_hook": True}
                                if rewritten else {})},
                            session_id=self.session_id,
@@ -626,7 +632,8 @@ class LifecycleRunner:
                               files_section=files_section,
                               standing_section=self._standing(ctx),
                               extra_section=self._extra_section(
-                                  ctx, outcome))
+                                  ctx, outcome),
+                              budget=self.settings.result_budget_chars)
         self._save_result(run_id, block)
         if self.transcript:
             capped, _ = cap_output(display_output, handle.output_file)
@@ -664,7 +671,8 @@ class LifecycleRunner:
                               files_section=files_section,
                               standing_section=self._standing(ctx),
                               extra_section=self._extra_section(
-                                  ctx, outcome))
+                                  ctx, outcome),
+                              budget=self.settings.result_budget_chars)
         self._save_result(run_id, block)
         self._set_clipboard(block)
         self.registry.set_state(handle, RunState.COMPLETED.value)
@@ -713,7 +721,8 @@ class LifecycleRunner:
                               files_section=files_section,
                               standing_section=self._standing(ctx),
                               extra_section=self._extra_section(
-                                  ctx, outcome))
+                                  ctx, outcome),
+                              budget=self.settings.result_budget_chars)
         self._save_result(ctx.run_id, block)
         self._set_clipboard(block)
         self.registry.set_state(handle, RunState.FAILED.value)

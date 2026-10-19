@@ -669,7 +669,10 @@ def test_output_cap_spills_to_file(make_runner):
     outcome = runner.process_text(shell_payload("make big"), "/tmp")
     block = outcome.result_block
     assert len(block) < 150_000
-    assert "truncated at 128k" in block
+    # Elided to a digest at the default budget; the full output is
+    # preserved byte-for-byte in the run's spill file.
+    assert "[output elided: " in block
+    assert " of 200000 chars shown" in block
     output_file = runner.state_dir / "runs" / outcome.run_id / "output.txt"
     assert output_file.read_text() == big
 

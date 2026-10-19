@@ -25,7 +25,9 @@ BUILTIN_TOOLS: list[dict] = [
     {
         "name": "shell.run",
         "description": "Run shell commands; output returns in a "
-                       "```result block.",
+                       "```result block. Oversized output is elided "
+                       "there — the block names the file holding the "
+                       "full output; page it, don't re-run.",
         "shape": "```shell fence; header lines session:/action:/cwd:/"
                  "timeout:/attend:, then the commands",
     },

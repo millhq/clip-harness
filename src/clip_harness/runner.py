@@ -41,9 +41,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from . import __version__
 from . import gate as gate_mod
 from . import hooks as hooks_mod
 from . import sandbox as sandbox_mod
+from . import updater
 from .core import (MAX_PAYLOAD_CHARS, Decision, Event, GateVerdict, Payload,
                    RunContext, RunState, cap_output, elide_output,
                    format_result, new_run_id, now_iso, sha256_text)
@@ -1463,6 +1465,14 @@ class LifecycleRunner:
         manifest = self._manifest_section(ctx)
         if manifest:
             parts.append(manifest)
+        # The update notice rides LAST in the middle, so it sits
+        # immediately above the sticky footer (and ends the block
+        # when there is no footer): the model reading the block back
+        # sees it too, which is the point of putting it in-band. The
+        # check is throttled to one fetch a day and never raises.
+        latest = updater.check_for_update(self.state_dir, __version__)
+        if latest:
+            parts.append(updater.notice_line(latest, __version__))
         return "\n".join(parts)
 
     def _dispatch(self, event: Event, ctx: RunContext, *,

@@ -373,6 +373,12 @@ files:
   operations above rather than ignoring it.
 - A `— capabilities:` section appears when your available tools have
   changed (see the manifest above).
+- An `[update]` line may sit immediately above the footer: a newer
+  clip-harness release exists. Mention it to the human — upgrading
+  is theirs to run by hand (`clip-harness upgrade`; the harness
+  never updates itself silently). `clip` is installed as a short
+  alias for the `clip-harness` command — the two names are the
+  same tool.
 
 Other things you may receive instead of a result block:
 

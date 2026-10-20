@@ -36,6 +36,18 @@ class FakeExecutor:
                           output_file=str(output_path))
 
 
+@pytest.fixture(autouse=True)
+def _offline_update_feed(tmp_path, monkeypatch):
+    """Keep every test offline-deterministic for the update check:
+    the runner consults the feed through CLIP_HARNESS_UPDATE_BASE,
+    pointed here at an empty file:// directory — the fetch fails
+    fast, the verdict is None, and no [update] line can appear
+    unless a test seeds the state dir's update cache itself."""
+    feed = tmp_path / "update-feed"
+    feed.mkdir()
+    monkeypatch.setenv("CLIP_HARNESS_UPDATE_BASE", feed.as_uri())
+
+
 @pytest.fixture
 def clipboard():
     return MemoryClipboard()

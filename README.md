@@ -28,6 +28,10 @@ clip-harness init                  # installs the default hooks + a
 
 For iTerm2 tab execution (optional): `pipx install 'clip-harness[iterm2]'`.
 
+The install also puts a short alias on your PATH: **`clip`** is the
+same command as `clip-harness` (two entry points, one main). The
+docs use the canonical name throughout.
+
 ## Quick start
 
 1. Wire the trigger: your own Apple Shortcut/hotkey (e.g. Cmd+Shift+E)
@@ -98,6 +102,7 @@ Two consequences worth naming:
 | `goalstore` | the durable goal ledger: SQLite store, revisions, CAS, action-id idempotency, export/import, legacy migration |
 | `manifest` | the capability manifest (built-ins + hook-registered tools) |
 | `settings` | user/project settings, merged Claude Code-style |
+| `updater` | the throttled update check + the checksum-verified self-upgrade |
 | `executor` | the local subprocess backend |
 | `adapters/` | tool mapping: macOS (pbpaste/pbcopy, VS Code), iTerm2 watch, headless stand-ins |
 | `defaults` | the shipped default hooks installed by `clip-harness init` |
@@ -422,7 +427,9 @@ version and no separate machine version.
   Hook `additionalContext`, capability-manifest refreshes, and
   pending state all sit *above* the footer; the footer is always
   last. Unbound runs carry neither the footer nor manifest
-  refreshes.
+  refreshes. One more line may sit immediately above the footer
+  (or end an unbound block): the `[update]` notice, when a newer
+  release is available (see *Updating*).
 - A rejection puts plain rejection text on the clipboard instead
   (the rejected diffs included, marked rejected, with the reason),
   ready to paste back so the model can re-propose.
@@ -757,13 +764,50 @@ clip-harness cancel [ID]          # bound id, or the last run
 clip-harness rerun [ID]
 clip-harness finish [--run ID|--session ID] [--copy]
 clip-harness receipt [--run ID] [--tail N] [--summary]
-clip-harness version
+clip-harness version [--check]    # --check: a fresh update check
+clip-harness upgrade              # verified self-upgrade (see Updating)
 ```
 
 Headless use (tests, demos, CI): set `CLIP_HARNESS_CLIPBOARD_FILE` to
 use a file as the clipboard, and wire hook commands that log instead
 of notifying. `examples/sample_session/run_demo.py` runs the full
 lifecycle this way.
+
+## Updating
+
+The harness never updates itself silently — a tool whose job is
+reviewing what executes does not change underneath a session. The
+pattern is the converged dev-tool one (gh, npm, rustup): notify
+in-band, upgrade on one explicit, verified command.
+
+- **The notice rides the result blocks.** At most once a day the
+  harness checks the release feed — GitHub Releases'
+  `/releases/latest/download/SHA256SUMS`, no token, no account —
+  and caches the verdict in `<state_dir>/update-check.json`. When a
+  newer release exists, result blocks gain one line immediately
+  above the sticky footer (or at the end of an unbound block):
+
+  `[update] clip-harness 0.3.0 is available (you run 0.2.1) — upgrade with: clip-harness upgrade`
+
+  The model reading the block back sees it too, so it can tell you
+  you're behind. An unreachable feed means no line and no error:
+  the check never fails, delays, or otherwise touches a run.
+- **`clip-harness upgrade`** does the swap. It reads the latest
+  release's SHA256SUMS, downloads the wheel, and **verifies its
+  sha256 before installing anything** — a mismatch, or a feed
+  naming no wheel, aborts with nothing installed. The verified
+  wheel installs into the current environment with the current
+  interpreter (the pipx venv the harness itself runs in), which
+  also regenerates the `clip` alias; the new version takes effect
+  on the next run. Already current: it says so and exits 0. If pip
+  is unavailable in the environment it prints the equivalent
+  manual `pipx` commands instead.
+- **`clip-harness version --check`** forces a fresh check on
+  demand, ignoring the daily throttle, and prints the verdict.
+
+`CLIP_HARNESS_UPDATE_BASE` overrides the feed base URL — mirror
+support, and how the test suites point the whole mechanism at a
+local `file://` directory feed.
 
 ## Security model
 
@@ -821,7 +865,7 @@ built against a full OpenSSL.
 
 ```sh
 pip install -e '.[dev]'
-python3 -m pytest        # 340 tests: parser, gate, contract, lifecycle
+python3 -m pytest        # 387 tests: parser, gate, contract, lifecycle
 ```
 
 Design rationale, in one line: correctness and contracts live in

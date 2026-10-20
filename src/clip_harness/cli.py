@@ -536,7 +536,22 @@ def cmd_receipt(args) -> int:
 
 def cmd_version(args) -> int:
     print(f"clip-harness {__version__}")
+    if args.check:
+        from . import updater
+        settings = load_settings()
+        latest = updater.check_for_update(
+            settings.state_dir, __version__, force=True)
+        if latest:
+            print(f"update available: clip-harness {latest} — "
+                  f"upgrade with: clip-harness upgrade")
+        else:
+            print("clip-harness is up to date")
     return 0
+
+
+def cmd_upgrade(args) -> int:
+    from . import updater
+    return updater.upgrade(__version__)
 
 
 # ----------------------------------------------------------------------
@@ -637,7 +652,17 @@ def build_parser() -> argparse.ArgumentParser:
     receipt.add_argument("--summary", action="store_true")
     receipt.set_defaults(fn=cmd_receipt)
 
-    sub.add_parser("version").set_defaults(fn=cmd_version)
+    version = sub.add_parser("version")
+    version.add_argument("--check", action="store_true",
+                         help="also check the release feed for a "
+                              "newer version (ignores the daily "
+                              "throttle)")
+    version.set_defaults(fn=cmd_version)
+
+    sub.add_parser("upgrade",
+                   help="download the latest release, verify its "
+                        "checksum, and install it") \
+        .set_defaults(fn=cmd_upgrade)
     return parser
 
 

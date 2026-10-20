@@ -57,7 +57,9 @@ class Env:
         self.proj = self.root / "proj"
         self.state = self.root / "state"
         self.hooks_dir = self.root / "hooks"
-        for d in (self.home, self.proj, self.state, self.hooks_dir):
+        self.feed = self.root / "feed"
+        for d in (self.home, self.proj, self.state, self.hooks_dir,
+                  self.feed):
             d.mkdir(parents=True)
         (self.proj / ".clip-harness").mkdir()
         self.clip = self.root / "clip.txt"
@@ -92,6 +94,11 @@ class Env:
         env = {"HOME": str(self.home), "PATH": os.environ["PATH"],
                "CLIP_HARNESS_CLIPBOARD_FILE": str(self.clip),
                "CLIP_HARNESS_STATE": str(self.state),
+               # Offline by default: the update check reads its feed
+               # from an empty local directory (fetch fails -> no
+               # [update] line) unless a case seeds the cache or
+               # overrides the base with a real feed of its own.
+               "CLIP_HARNESS_UPDATE_BASE": self.feed.as_uri(),
                "CLIP_HARNESS_ATTEND_WAIT_S": "0"}
         if over:
             env.update(over)
@@ -1881,6 +1888,57 @@ def case_63(env: Env):
     check("Migrated goal" in proc.stdout
           and "goal_uid:" in proc.stdout,
           f"session show lost the migrated goal: {proc.stdout!r}")
+
+
+def case_64(env: Env):
+    # The [update] notice: a fresh update cache claiming a newer
+    # release puts exactly one line in the result block, immediately
+    # BEFORE the sticky [goal] footer (the footer stays the tail).
+    (env.state / "update-check.json").write_text(json.dumps(
+        {"checked_at": time.time(), "latest": "99.0.0"}),
+        encoding="utf-8")
+    env.run_payload("```shell\nsession: up64\naction: goal-set\n"
+                    "Ship the update notice\n```")
+    env.run_payload("```shell\nsession: up64\necho hello\n```")
+    block = env.clip_text()
+    line = "[update] clip-harness 99.0.0 is available"
+    check(line in block, f"no [update] line in block: {block!r}")
+    check(block.count("[update]") == 1,
+          f"[update] line duplicated: {block!r}")
+    check(block.index(line) < block.index("[goal]"),
+          f"[update] line is not before the footer: {block!r}")
+
+
+def case_65(env: Env):
+    # An up-to-date cache (fresh, no newer version) -> no notice.
+    (env.state / "update-check.json").write_text(json.dumps(
+        {"checked_at": time.time(), "latest": None}),
+        encoding="utf-8")
+    env.run_payload("```shell\necho hi\n```")
+    block = env.clip_text()
+    check("[update]" not in block,
+          f"unexpected [update] line in block: {block!r}")
+
+
+def case_66(env: Env):
+    # `upgrade` against a file:// feed reporting the CURRENT version:
+    # prints already-latest and installs nothing (exit 0).
+    proc = env.cli("version")
+    current = proc.stdout.split()[-1]
+    feed = env.root / "feed66"
+    feed.mkdir()
+    wheel = f"clip_harness-{current}-py3-none-any.whl"
+    (feed / wheel).write_bytes(b"not a real wheel - never downloaded")
+    (feed / "SHA256SUMS").write_text(
+        f"{'a' * 64}  {wheel}\n"
+        f"{'b' * 64}  clip_harness-{current}.tar.gz\n",
+        encoding="utf-8")
+    proc = env.cli("upgrade", env_over={
+        "CLIP_HARNESS_UPDATE_BASE": feed.as_uri()})
+    check(proc.returncode == 0,
+          f"upgrade failed: {proc.stdout!r} {proc.stderr!r}")
+    check("already the latest release" in proc.stdout,
+          f"upgrade did not report already-latest: {proc.stdout!r}")
 
 
 # =======================================================================

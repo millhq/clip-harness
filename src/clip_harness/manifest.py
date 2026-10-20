@@ -40,6 +40,20 @@ BUILTIN_TOOLS: list[dict] = [
                  "`op: create|update|delete`, then the FULL content",
     },
     {
+        "name": "file.edit",
+        "description": "Propose an exact-text edit to ONE existing "
+                       "file: old_string must match the file exactly "
+                       "(whitespace included) and be unique, unless "
+                       "replace_all is set. Staged and reviewed like "
+                       "file.write — the harness generates the diff, "
+                       "so never hand-count patch hunks for a change "
+                       "you can express as an edit.",
+        "shape": "```edit fence; first line `path: <path>`, optional "
+                 "`replace_all: true|false`, then an `old_string:` "
+                 "section and a `new_string:` section with the exact "
+                 "text (empty new_string deletes the matched block)",
+    },
+    {
         "name": "patch.apply",
         "description": "Propose a change to one file as a unified "
                        "diff. Staged and reviewed like file.write.",

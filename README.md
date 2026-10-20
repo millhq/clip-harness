@@ -118,13 +118,13 @@ enhancement over "whatever is on the clipboard runs", never a
 requirement for the simple case:
 
 1. **```shell fence** — commands with a metadata header.
-2. **```file / ```patch fences** — proposed file changes.
+2. **```file / ```patch / ```edit fences** — proposed file changes.
 3. **Unfenced contents beginning with a metadata header** — the
    shell fence's contents standing alone, when the fence was lost
    in copying (see "When the fence is lost in copying", below).
 4. **Unfenced contents beginning with a `path:` header** — the
-   ```file / ```patch fences' contents standing alone, under
-   stricter recognition rules (same section, below).
+   ```file / ```patch / ```edit fences' contents standing alone,
+   under stricter recognition rules (same section, below).
 5. **Bare clipboard text** — treated as a single unbound command
    (only on the explicit trigger path; the passive `watch` loop never
    auto-runs bare text).
@@ -185,19 +185,22 @@ command, and goal/task `action:` payloads work identically. Bound
 runs get the same manifest and sticky footer as fenced runs.
 
 The mutation fences get the same tolerance, under stricter rules.
-Text whose first line is an exact `path:` header is the ```file or
-```patch fence's contents when what follows disambiguates it: an
-explicit `op:` line makes it a file payload — file.write
-**requires** that op in this form, and the unfenced form is
-stricter than the fence: the op must be `create`, `update` or
+Text whose first line is an exact `path:` header is the ```file,
+```patch or ```edit fence's contents when what follows
+disambiguates it: an explicit `op:` line makes it a file payload —
+file.write **requires** that op in this form, and the unfenced form
+is stricter than the fence: the op must be `create`, `update` or
 `delete` (`auto` is fenced-only), create/update require the file
 content as a non-empty body, and delete requires an empty body. A
 body beginning with a unified-diff header (`---` then `+++`) makes
 it a patch payload. (The op wins if both are present: a file
-whose content is itself a diff is legitimate.) The payload then
-flows through the identical staging, review and apply path as a
-fenced one — same manifest, same base-hash checks, same
-traversal rejection at staging.
+whose content is itself a diff is legitimate.) A following
+`replace_all:` line or an exact `old_string:` line makes it an
+edit payload, parsed with the same strictness as the fence — a
+malformed edit fails closed here too, never falling through to
+bare shell text. The payload then flows through the identical
+staging, review and apply path as a fenced one — same manifest,
+same base-hash checks, same traversal rejection at staging.
 
 This is a tolerance for a copying artifact, not a second format:
 
@@ -286,6 +289,70 @@ are a pure mutation payload; a header-only shell fence binds one to a
 session. For ```patch fences, `path:` is the authoritative target:
 the diff's `---`/`+++` header filenames are checked against it and
 normalized to it before application, whatever shape they arrive in.
+
+### The ```edit fence — exact-text edits
+
+For a change to an existing file, prefer ```edit over ```patch:
+the model supplies exact text instead of a hand-counted diff, and
+the harness computes the candidate bytes and generates the review
+diff itself:
+
+````
+```edit
+path: src/auth.py
+replace_all: false
+old_string:
+def old():
+    return 1
+new_string:
+def new():
+    return 2
+```
+````
+
+The rules mirror Claude Code's Edit tool, which this maps onto:
+
+- `path:` is required and first — the authoritative target,
+  exactly like the other mutation fences.
+- `replace_all:` is an optional header line (Claude Code's exact
+  parameter name); only the literal values `true` / `false` are
+  valid — anything else is malformed and fails closed. Default
+  `false`.
+- The sections are delimited by lines that are exactly
+  `old_string:` and then exactly `new_string:` — the first
+  `new_string:` line after `old_string:` is the delimiter. A
+  section's text is its lines joined with newlines, with no
+  trailing newline.
+- Matching is exact, whitespace included, against the live file
+  (which must decode as UTF-8). The gate fails the staging when
+  `old_string` occurs zero times (the remedy: copy the exact
+  current text, whitespace included, and re-send), or more than
+  once without `replace_all: true` (the remedies: include more
+  surrounding context to make it unique, or set `replace_all`).
+  `old_string` equal to `new_string` fails too — there is nothing
+  to change.
+- An empty `new_string:` section is valid: it **deletes** the
+  matched block. An **insert** is expressed inside the same one
+  operation — `new_string` carries the anchor text plus the new
+  text. There are no other edit operations.
+- An empty `old_string`, a missing section marker, or an `op:`
+  line is malformed and fails closed. An edit **never creates a
+  file** — its target must already exist; creation is the ```file
+  fence's job, and the staging error says so.
+- **One edit per file per payload:** a second spec for the same
+  path where at least one is an edit is rejected at staging. Like
+  sequential Edit calls, the next edit goes in the next payload,
+  after the result; a multi-part change to one file travels as a
+  single ```file fence or a single valid ```patch.
+- If the text being edited itself contains a literal line that is
+  exactly `old_string:` or `new_string:`, the section markers
+  collide — send that change as a ```file fence instead.
+- ```patch stays for pre-generated, known-valid diffs (produced
+  by a tool, not hand-written). A patch whose @@ header counts
+  don't match its body fails staging with a diagnostic naming,
+  per offending hunk, the declared vs actual old/new counts —
+  and the error points back here: fix the @@ counts, or re-send
+  the change as an ```edit fence.
 
 ### Control triggers
 
@@ -380,8 +447,9 @@ State is stored per session under the state dir and survives restarts.
 The manifest is the discovery mechanism by which the chat model gains
 capabilities over the clipboard transport: a compact list of the
 tools it may invoke, each with the block shape that invokes it
-(`shell.run`, `file.write`, `patch.apply`, `session.cancel`,
-`session.rerun`, `goal.set`, `task.add`, `task.update`, …). The core
+(`shell.run`, `file.write`, `file.edit`, `patch.apply`,
+`session.cancel`, `session.rerun`, `goal.set`, `task.add`,
+`task.update`, …). The core
 generates it for the built-ins; settings may declare more under
 `"tools"`; and **hooks may register additional tools at runtime** via
 `registeredTools` in their output — a registered tool appears in the
@@ -675,7 +743,7 @@ built against a full OpenSSL.
 
 ```sh
 pip install -e '.[dev]'
-python3 -m pytest        # 112 tests: parser, gate, contract, lifecycle
+python3 -m pytest        # 340 tests: parser, gate, contract, lifecycle
 ```
 
 Design rationale, in one line: correctness and contracts live in

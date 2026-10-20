@@ -99,22 +99,42 @@ class Decision(str, Enum):
 
 @dataclass
 class FileSpec:
-    """One file change proposed by a ```file or ```patch fence.
+    """One file change proposed by a ```file, ```patch or ```edit fence.
 
     `declared_op` is what the payload claims (create/update/delete/auto);
     the gate classifies it against disk reality and flags mismatches.
-    Exactly one of `content` (full file body) or `patch` (unified diff)
-    is set.
+    Exactly one of `content` (full file body), `patch` (unified diff)
+    or the edit pair (`old_string` / `new_string`) is set.
+
+    An edit spec is Claude Code's Edit tool mapped onto the fence:
+    `old_string` is the exact text to find in the live file (unique,
+    unless `replace_all`), `new_string` its replacement (empty =
+    delete the matched block; an insert is `new_string` carrying the
+    anchor plus the new text). The gate computes the candidate bytes
+    from the live file — the model never hand-writes a diff — and an
+    edit's declared op is always "update": edits only ever target
+    existing files (creation is file.write's job).
     """
 
     path: str
     declared_op: str = "auto"  # create | update | delete | auto
     content: str | None = None
     patch: str | None = None
+    old_string: str | None = None
+    new_string: str | None = None
+    replace_all: bool = False
+
+    def __post_init__(self) -> None:
+        if self.is_edit:
+            self.declared_op = "update"
 
     @property
     def is_patch(self) -> bool:
         return self.patch is not None
+
+    @property
+    def is_edit(self) -> bool:
+        return self.old_string is not None
 
 
 @dataclass

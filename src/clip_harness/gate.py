@@ -526,6 +526,68 @@ def _normalize_patch(patch_text: str,
     return text if text.endswith("\n") else text + "\n"
 
 
+def _validate_patch_hunk_counts(patch_text: str, spec_path: str) -> None:
+    """Check every hunk's @@ header counts against its actual body.
+
+    A model that hand-writes a unified diff must hand-count the
+    lines in each hunk, and a wrong count makes git reject the patch
+    with an opaque "corrupt patch" — the staging failure here names,
+    per offending hunk, the DECLARED counts and the ACTUAL counts,
+    and points at the remedies. The count is computed independently
+    of `_patch_sections`' declared-count consumption: a hunk body
+    runs from its @@ header to the next @@ header, the next ---/+++
+    section, a `diff --git` line, or EOF; body lines count as old
+    (context + removed) and new (context + added), and "\\" lines
+    ("\\ No newline at end of file") count for neither.
+    """
+    lines = patch_text.splitlines()
+    problems: list[str] = []
+    hunk_no = 0
+    i = 0
+    while i < len(lines):
+        header = _HUNK_HEADER_RE.match(lines[i])
+        if not header:
+            i += 1
+            continue
+        hunk_no += 1
+        declared_old = int(header.group(2)) if header.group(2) else 1
+        declared_new = int(header.group(4)) if header.group(4) else 1
+        i += 1
+        actual_old = actual_new = 0
+        while i < len(lines):
+            line = lines[i]
+            if _HUNK_HEADER_RE.match(line) \
+                    or line.startswith("diff --git "):
+                break
+            if line.startswith("--- ") and i + 1 < len(lines) \
+                    and lines[i + 1].startswith("+++ "):
+                break
+            if line.startswith("\\"):
+                pass  # "\ No newline at end of file" counts neither way
+            elif line.startswith("-"):
+                actual_old += 1
+            elif line.startswith("+"):
+                actual_new += 1
+            elif line.startswith(" ") or line == "":
+                actual_old += 1  # context (incl. a bare empty line)
+                actual_new += 1
+            else:
+                break
+            i += 1
+        if (actual_old, actual_new) != (declared_old, declared_new):
+            problems.append(
+                f"hunk {hunk_no} declares -{declared_old}/"
+                f"+{declared_new} but its body has {actual_old} old / "
+                f"{actual_new} new lines")
+    if problems:
+        raise GateError(
+            f"patch for {spec_path} has malformed hunk counts: "
+            + "; ".join(problems)
+            + " — fix the @@ counts, or re-send the change as an "
+              "```edit fence (exact old/new text; the harness "
+              "generates the diff)")
+
+
 def _apply_patch(live: bytes | None, patch_text: str, spec_path: str,
                  abs_path: Path) -> bytes | None:
     """Turn a unified diff into candidate content by delegating to
@@ -539,6 +601,7 @@ def _apply_patch(live: bytes | None, patch_text: str, spec_path: str,
     harness process cwd is irrelevant. Returns the post-patch
     bytes, or None when the patch deletes the file.
     """
+    _validate_patch_hunk_counts(patch_text, spec_path)
     sections = _validate_patch_target(patch_text, spec_path, abs_path)
     normalized = _normalize_patch(patch_text, sections, abs_path)
     with tempfile.TemporaryDirectory(prefix="clip-harness-patch-") as tmp:
@@ -560,6 +623,54 @@ def _apply_patch(live: bytes | None, patch_text: str, spec_path: str,
         return target.read_bytes()
 
 
+def _apply_edit(live: bytes | None, spec: FileSpec) -> bytes:
+    """Turn an edit spec into candidate content: Claude Code's Edit
+    semantics against the live bytes.
+
+    The model supplies exact text, never a diff: `old_string` must
+    occur in the live file — zero occurrences fails (the remedy is
+    copying the exact current text, whitespace included), more than
+    one fails without `replace_all` (the remedies are more
+    surrounding context, or `replace_all: true`). The candidate is
+    the live text with the match (or every match) replaced by
+    `new_string`; everything downstream — staging, the review diff,
+    the base-hash check — is the ordinary mutation path, and the
+    harness generating the diff from these computed bytes is the
+    point of the tool. The replacement text is data: it is
+    substituted as text and never reaches a shell.
+    """
+    if live is None:
+        raise GateError(
+            f"edit target {spec.path} does not exist — an edit only "
+            f"changes an existing file; create it with a ```file "
+            f"fence instead")
+    try:
+        text = live.decode("utf-8")
+    except UnicodeDecodeError:
+        raise GateError(
+            f"edit target {spec.path} is not UTF-8 text — an edit "
+            f"matches exact text; use a ```file fence for this file")
+    old = spec.old_string or ""
+    new = spec.new_string or ""
+    if old == new:
+        raise GateError(
+            f"edit for {spec.path} has identical old_string and "
+            f"new_string — there is nothing to change")
+    count = text.count(old)
+    if count == 0:
+        raise GateError(
+            f"edit for {spec.path}: old_string not found in the "
+            f"file — copy the exact current text, including "
+            f"whitespace, and re-send")
+    if count > 1 and not spec.replace_all:
+        raise GateError(
+            f"edit for {spec.path}: old_string matches {count} "
+            f"places in the file — include more surrounding context "
+            f"to make it unique, or set replace_all: true to "
+            f"replace all {count}")
+    return text.replace(old, new).encode("utf-8")
+
+
 def classify_and_stage(candidate_dir: Path, run_id: str,
                        session_id: str | None,
                        specs: list[FileSpec], cwd: Path) -> Candidate:
@@ -569,7 +680,10 @@ def classify_and_stage(candidate_dir: Path, run_id: str,
     directory (``../`` traversal) is rejected — GateError, fail
     closed — before anything is staged. An absolute path names its
     target explicitly and stages like any other target, behind the
-    same review gate.
+    same review gate. An edit spec's candidate bytes are computed
+    from the live file at staging time (`_apply_edit`), and two
+    specs for one path where at least one is an edit are rejected
+    outright (see the check below).
     """
     candidate_dir.mkdir(parents=True, exist_ok=True)
     (candidate_dir / "candidates").mkdir(exist_ok=True)
@@ -577,6 +691,25 @@ def classify_and_stage(candidate_dir: Path, run_id: str,
     candidate = Candidate(candidate_id=candidate_dir.name, run_id=run_id,
                           session_id=session_id, dir=candidate_dir)
     cwd_root = cwd.resolve()
+
+    # One edit per file per payload. An edit transforms the live
+    # bytes, so a second spec for the same path — another edit, or
+    # any other fence — has no well-defined base to transform.
+    # Like sequential Claude Code Edit calls, the next edit goes in
+    # the next payload, after the result; a multi-part change to
+    # one file travels as a single file.write or a valid patch.
+    # Rejected before anything is staged.
+    path_counts: dict[str, int] = {}
+    for spec in specs:
+        path_counts[spec.path] = path_counts.get(spec.path, 0) + 1
+    for spec in specs:
+        if spec.is_edit and path_counts[spec.path] > 1:
+            raise GateError(
+                f"multiple changes for {spec.path} in one payload, "
+                f"one of them an edit — send one edit per file per "
+                f"payload (the next edit goes in the next payload), "
+                f"or send the whole change for that file as one "
+                f"```file or ```patch fence")
 
     for index, spec in enumerate(specs):
         abs_path = (cwd / spec.path).resolve()
@@ -588,7 +721,9 @@ def classify_and_stage(candidate_dir: Path, run_id: str,
         live = abs_path.read_bytes() if abs_path.is_file() else None
         base_hash = sha256_bytes(live) if live is not None else None
 
-        if spec.declared_op == "delete":
+        if spec.is_edit:
+            candidate_bytes = _apply_edit(live, spec)
+        elif spec.declared_op == "delete":
             candidate_bytes = None
         elif spec.is_patch:
             candidate_bytes = _apply_patch(live, spec.patch or "",

@@ -262,6 +262,48 @@ def test_legacy_session_store_migrates_once(tmp_path):
     assert len(again.list_goals()) == 2
 
 
+def _construct_ledger_barriered(state_dir: str, barrier, queue) -> None:
+    try:
+        barrier.wait(timeout=15)
+        GoalLedger(state_dir)
+        queue.put("")
+    except Exception as exc:  # reported to the parent for assertion
+        queue.put(f"{type(exc).__name__}: {exc}")
+
+
+def test_concurrent_first_construction_races_safely(tmp_path):
+    """Regression (release gates 0.2.0/0.2.1, E2E case 33): two
+    processes constructing a GoalLedger on one FRESH state dir at
+    the same instant. The WAL pragma refused the busy timeout
+    (loser died with "database is locked" before its run started),
+    and the migration marker check sat outside its transaction
+    (loser died on the marker's UNIQUE constraint, or double-
+    imported). Barrier-synchronized construction must now succeed
+    in both processes, with the legacy goal imported exactly once.
+    """
+    import multiprocessing as mp
+
+    for trial in range(3):
+        state = tmp_path / f"state-{trial}"
+        _write_legacy(state, "race-work",
+                      {"goal": {"title": "Race goal", "status": "active"},
+                       "tasks": [{"title": "t1", "status": "open"}]})
+        barrier = mp.Barrier(2)
+        queue = mp.Queue()
+        procs = [mp.Process(target=_construct_ledger_barriered,
+                            args=(str(state), barrier, queue))
+                 for _ in range(2)]
+        for proc in procs:
+            proc.start()
+        errors = [queue.get(timeout=30) for _ in range(2)]
+        for proc in procs:
+            proc.join(timeout=30)
+        assert errors == ["", ""], f"trial {trial}: {errors}"
+        ledger = GoalLedger(state)
+        assert [r["goal"] for r in ledger.list_goals()] == ["Race goal"]
+        assert (state / "goals" / "race-work.json.migrated").exists()
+
+
 # -- parser: the new headers -----------------------------------------------------
 
 

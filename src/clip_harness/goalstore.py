@@ -50,6 +50,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 
@@ -131,8 +132,29 @@ class GoalLedger:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+        # The WAL transition needs a brief exclusive moment, and —
+        # unlike ordinary statements — this pragma does not honor
+        # the busy timeout: two processes initializing a fresh
+        # ledger at the same instant race here and the loser gets
+        # "database is locked" immediately, dying before its run
+        # ever starts (E2E case 33 in the 0.2.0/0.2.1 release gates;
+        # reproduced 25/40 with barrier-synchronized starts). Once
+        # any process completes the transition the pragma is a
+        # no-op, so a short bounded retry converges as soon as the
+        # winner finishes.
+        deadline = time.monotonic() + 15
+        delay = 0.025
+        while True:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                return conn
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc) \
+                        or time.monotonic() >= deadline:
+                    conn.close()
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 0.5)
 
     def _init_schema(self) -> None:
         conn = self._connect()
@@ -643,15 +665,24 @@ class GoalLedger:
         bound, and the file is renamed `<name>.migrated`."""
         conn = self._connect()
         try:
+            # The marker check must live INSIDE the immediate
+            # transaction: checked before BEGIN, two processes
+            # initializing a fresh ledger together both saw "not
+            # migrated", both ran the import, and the loser's
+            # marker INSERT died on the UNIQUE constraint (the
+            # second half of the case-33 startup race). Inside
+            # BEGIN IMMEDIATE the loser blocks until the winner
+            # commits, then sees the marker and stands down.
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT value FROM meta WHERE key = ?",
                 ("legacy_goals_migrated",)).fetchone()
             if row is not None:
+                conn.rollback()
                 return
             legacy_dir = self.state_dir / "goals"
             files = (sorted(legacy_dir.glob("*.json"))
                      if legacy_dir.exists() else [])
-            conn.execute("BEGIN IMMEDIATE")
             for path in files:
                 note = self._migrate_legacy_file(conn, path)
                 if note is not None:

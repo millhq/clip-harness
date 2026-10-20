@@ -7,12 +7,12 @@ the active goal and open tasks on every action and doesn't drift. A nag
 that depends on an optional, removable, fail-open hook is not a nag.
 
 The state itself is DURABLE (see goalstore.py): goals are first-class
-objects in a SQLite ledger, issued an immutable goal_uid, referenced
+objects in a file store, issued an immutable goal_uid, referenced
 by sessions through a binding — never owned by them. This module is
-the session-bound VIEW over that ledger: given a session id it
-resolves the bound goal and offers the goal/task operations the
-runner and the terminal CLI drive. Unbound runs anchor to nothing:
-their result blocks carry no goal section.
+the session-bound VIEW over that store: given a session id it
+resolves the bound goal and offers the goal/task/plan operations
+the runner and the terminal CLI drive. Unbound runs anchor to
+nothing: their result blocks carry no goal section.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ __all__ = ["GOAL_STATUSES", "SETTABLE_GOAL_STATUSES", "TASK_STATUSES",
 
 
 class GoalStore:
-    """The goal/task view of ONE session binding over the ledger."""
+    """The goal/task view of ONE session binding over the store."""
 
     def __init__(self, state_dir: Path | str, binding_id: str):
         self.binding_id = binding_id
@@ -187,6 +187,28 @@ class GoalStore:
             action_scopes=self._scopes(action_scopes),
             outcome=outcome)
         return applied, errors
+
+    # -- plan (a document — authored whole, replaced whole) -------------------
+
+    def plan(self) -> str | None:
+        """The bound goal's plan document, verbatim — or None."""
+        record = self.record()
+        return record["plan"] if record else None
+
+    def set_plan(self, document: str, *,
+                 expect_revision: int | None = None,
+                 action_id: str | None = None,
+                 action_scopes: list[str] | None = None,
+                 outcome: str = "") -> dict:
+        """Replace the bound goal's plan document, whole — a goal
+        mutation (revision +1, the usual guards). A session with
+        no goal yet materialises one, as task-add does."""
+        record = self._ensure_record()
+        return self.ledger.set_plan(
+            record["goal_uid"], document,
+            expect_revision=expect_revision, action_id=action_id,
+            action_scopes=self._scopes(action_scopes),
+            outcome=outcome or "plan set")
 
     def tasks(self) -> list[dict]:
         record = self.record()

@@ -87,20 +87,43 @@ BUILTIN_TOOLS: list[dict] = [
     {
         "name": "goal.list",
         "description": "List every durable goal (goal_uid, id, "
-                       "status, revision, current plan step). "
-                       "Read-only — use it to rediscover a goal "
-                       "after losing the chat or session.",
+                       "status, revision). Read-only — use it to "
+                       "rediscover a goal after losing the chat or "
+                       "session.",
         "shape": "```shell fence with header `action: goal-list` "
                  "(no body, no session needed)",
     },
     {
         "name": "goal.show",
-        "description": "Show one durable goal in full: goal text, "
-                       "plan + steps, tasks, backlog, latest result, "
-                       "revision, provenance. Read-only.",
+        "description": "Show one durable goal: goal text, its "
+                       "tasks, a pointer to its plan document, "
+                       "latest result, revision, provenance. "
+                       "Read-only.",
         "shape": "```shell fence with headers `action: goal-show` "
                  "and `goal: <goal_uid>` (or the session's bound "
                  "goal when no `goal:` header is given)",
+    },
+    {
+        "name": "plan.set",
+        "description": "Set the goal's plan: a Markdown DOCUMENT "
+                       "you author whole — its title line is its "
+                       "version identity (e.g. '# PLAN v2'). "
+                       "Replaces any existing plan whole; the "
+                       "harness stores it verbatim and never "
+                       "parses steps or statuses out of it. Counts "
+                       "as a goal mutation: guard it with "
+                       "`expect-revision:` / `action-id:` like one.",
+        "shape": "```shell fence with header `action: plan-set` "
+                 "and `session: <id>` (or `goal: <goal_uid>`); "
+                 "body = the ENTIRE Markdown plan document",
+    },
+    {
+        "name": "plan.show",
+        "description": "Show the goal's plan document, verbatim. "
+                       "Read-only.",
+        "shape": "```shell fence with header `action: plan-show` "
+                 "(no body; the session's bound goal, or the "
+                 "`goal:` header's goal)",
     },
     {
         "name": "task.add",

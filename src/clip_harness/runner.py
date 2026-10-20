@@ -52,7 +52,8 @@ from .core import (MAX_PAYLOAD_CHARS, Decision, Event, GateVerdict, Payload,
 from .executor import Executor, LocalExecutor
 from .goals import (DuplicateAction, GoalStore, GoalStoreError,
                     StaleRevision, render_section)
-from .goalstore import (GoalLedger, render_goal_list, render_goal_show)
+from .goalstore import (GoalLedger, render_goal_list, render_goal_show,
+                        render_plan_show)
 from .manifest import ManifestStore
 from .payload import PayloadError, parse_clipboard_text
 from .receipts import Ledger, Transcript
@@ -60,12 +61,12 @@ from .sessions import RunHandle, SessionRegistry
 from .settings import Settings, add_project_allowlist_pattern, load_settings
 
 ACTION_OPS = {"goal-set", "goal-status", "goal-list", "goal-show",
-              "task-add", "task-update"}
+              "task-add", "task-update", "plan-set", "plan-show"}
 
 # Goal actions that only READ the durable store: no session anchor
-# required (goal-list is global; goal-show reads the header's uid or
-# the session's bound goal), no gate, no execution.
-READONLY_GOAL_OPS = {"goal-list", "goal-show"}
+# required (goal-list is global; goal-show and plan-show read the
+# header's uid or the session's bound goal), no gate, no execution.
+READONLY_GOAL_OPS = {"goal-list", "goal-show", "plan-show"}
 
 # Single-task status actions, removed outright (no backward compat —
 # migrate once to the latest): `task-update` replaces them. A payload
@@ -973,6 +974,11 @@ class LifecycleRunner:
                 output_lines.append(render_goal_show(
                     record, payload.goal_uid or ""))
                 record_after = record
+            elif action == "plan-show":
+                record = target_record()
+                output_lines.append(render_plan_show(
+                    record, payload.goal_uid or ""))
+                record_after = record
             elif payload.goal_uid and target_record() is None:
                 rejected = (f"no such goal: {payload.goal_uid} — "
                             f"discover goals with 'action: goal-list', "
@@ -1010,6 +1016,25 @@ class LifecycleRunner:
                     f"goal status: {goal['status']}" if goal
                     else "no goal set, or unknown status (expected "
                          "waiting, active, paused or complete)")
+            elif action == "plan-set":
+                # The body is the whole plan document, verbatim —
+                # never the split `lines` (that would mangle the
+                # Markdown). payload.command is already the parsed
+                # body (the parser strips only its outer edges).
+                document = payload.command
+                if payload.goal_uid:
+                    record_after = ledger.set_plan(
+                        payload.goal_uid, document, **guards,
+                        outcome="plan set")
+                else:
+                    record_after = store.set_plan(document, **guards)
+                doc_lines = document.strip().splitlines()
+                title = doc_lines[0].strip() if doc_lines else ""
+                output_lines.append(f"plan set: {title}"
+                                    if title else "plan set")
+                output_lines.append(
+                    f"goal_uid: {record_after['goal_uid']} · "
+                    f"revision {record_after['revision']}")
             elif action == "task-add":
                 if lines:
                     if payload.goal_uid:
@@ -1071,6 +1096,10 @@ class LifecycleRunner:
                 f"{t['status']}: {t['title']}"
                 for t in payload.transitions)
             ctx.command_executed = f"(task-update) {summary}".strip()
+        elif action == "plan-set":
+            # The document is data, not a command line — it never
+            # rides the executed-command slot.
+            ctx.command_executed = "(plan-set)"
         elif read_only:
             ctx.command_executed = f"({action})"
         else:

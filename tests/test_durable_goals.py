@@ -1,12 +1,17 @@
-"""The durable goal contract (0.2.0).
+"""The durable goal contract (0.3.0).
 
-Goals are durable objects in a SQLite ledger (goalstore.py), issued
-an immutable goal_uid and REFERENCED by sessions — the Anthropic
-shape — replacing the session-owned JSON store outright. This file
-covers the ledger (revisions, compare-and-swap, action-id
-idempotency, export/import), the new payload headers, the runner
-flows (binding, discovery, guards), the one-time legacy migration,
-and work Copilot's acceptance case end to end.
+Goal, plan and task are three separate things, following
+Anthropic's model: the GOAL is the anchor (a durable object in a
+file store — goalstore.py — issued an immutable goal_uid and
+REFERENCED by sessions, never owned by them); a TASK is its own
+object and the only tracked execution state; a PLAN is a Markdown
+DOCUMENT, authored and replaced whole, never parsed. This file
+covers the store (revisions, compare-and-swap, action-id
+idempotency, export/import), the plan actions, the payload
+headers, the runner flows (binding, discovery, guards), both
+one-time migrations (the 0.2.x SQLite ledger and the pre-0.2.0
+legacy session files), and work Copilot's acceptance case end
+to end.
 """
 
 from __future__ import annotations
@@ -32,8 +37,24 @@ from conftest import FakeExecutor
 
 NAV_UID = "33476ec7-1cfd-4634-93d6-ab22dde10b23"
 
+# The plan is a DOCUMENT now — this string is the whole of it, and
+# its title line ("# PLAN v2") is its version identity.
+NAV_PLAN = (
+    "# PLAN v2\n"
+    "\n"
+    "1. [done] Inventory the platform repositories\n"
+    "2. [done] Run Joern code-fact extraction\n"
+    "3. [done] Gradle supplier discovery with complete candidate "
+    "accounting\n"
+    "4. [done] Helm supplier discovery with complete candidate "
+    "accounting\n"
+    "5. [doing] OpenAPI supplier: normalize canonical contracts "
+    "and HTTP operations into generic units\n"
+    "6. [open] Reconcile suppliers into the canonical model\n"
+    "7. [open] Publish static projections")
+
 NAV_DOCUMENT = {
-    "schema": "clip-harness/goal-export@1",
+    "format": "clip-harness/goal-export@2",
     "exported_at": "2026-10-20T10:15:00-0400",
     "goal": {
         "goal_uid": NAV_UID,
@@ -43,51 +64,23 @@ NAV_DOCUMENT = {
                 "platform repositories",
         "status": "active",
         "revision": 2,
-        "plan": {
-            "revision_label": "PLAN v2",
-            "steps": [
-                {"n": 1, "title": "Inventory the platform repositories",
-                 "status": "done"},
-                {"n": 2, "title": "Run Joern code-fact extraction",
-                 "status": "done"},
-                {"n": 3, "title": "Gradle supplier discovery with "
-                                  "complete candidate accounting",
-                 "status": "done"},
-                {"n": 4, "title": "Helm supplier discovery with "
-                                  "complete candidate accounting",
-                 "status": "done"},
-                {"n": 5, "title": "OpenAPI supplier: normalize "
-                                  "canonical contracts and HTTP "
-                                  "operations into generic units",
-                 "status": "doing"},
-                {"n": 6, "title": "Reconcile suppliers into the "
-                                  "canonical model",
-                 "status": "open"},
-                {"n": 7, "title": "Publish static projections",
-                 "status": "open"},
-            ],
-            "current_step": 5,
-        },
-        "tasks": [
-            {"title": "Implement generic OpenAPI discovery with "
-                      "complete candidate accounting",
-             "status": "done"},
-            {"title": "Normalize canonical contracts and HTTP "
-                      "operations into generic units",
-             "status": "doing"},
-            {"title": "Add the Kustomize supplier", "status": "open"},
-        ],
-        "backlog": ["Backstage adapter spike", "Maven supplier"],
         "latest_result": "OpenAPI discovery complete: every "
                          "candidate accounted — unaccounted = 0",
-        "parent_uid": None,
-        "fork_revision": None,
-        "provenance": {"imported_from": "m365 harness (SQLite "
-                                        "ledger)",
+        "provenance": {"imported_from": "m365 harness",
                        "session": "velocity-navigator"},
         "created_at": "2026-10-12T09:00:00-0400",
         "updated_at": "2026-10-19T17:42:00-0400",
     },
+    "tasks": [
+        {"title": "Implement generic OpenAPI discovery with "
+                  "complete candidate accounting",
+         "status": "done"},
+        {"title": "Normalize canonical contracts and HTTP "
+                  "operations into generic units",
+         "status": "doing"},
+        {"title": "Add the Kustomize supplier", "status": "open"},
+    ],
+    "plan": NAV_PLAN,
 }
 
 
@@ -95,7 +88,7 @@ def _ledger(tmp_path) -> GoalLedger:
     return GoalLedger(tmp_path / "state")
 
 
-# -- ledger: creation, revisions, bindings -----------------------------------
+# -- store: creation, revisions, bindings -----------------------------------
 
 
 def test_create_goal_issues_uuid_and_revision_1(tmp_path):
@@ -141,7 +134,7 @@ def test_set_status_rejects_unsettable_and_bogus(tmp_path):
         ledger.set_status(uid, "bogus")
 
 
-# -- ledger: compare-and-swap + idempotency -----------------------------------
+# -- store: compare-and-swap + idempotency -----------------------------------
 
 
 def test_cas_guard_on_task_update(tmp_path):
@@ -178,7 +171,7 @@ def test_duplicate_action_id_rejected_before_mutation(tmp_path):
     assert ledger.action_outcome([uid], str(uuid.uuid4())) is None
 
 
-# -- ledger: export / import ----------------------------------------------------
+# -- store: export / import ----------------------------------------------------
 
 
 def test_export_import_round_trip_is_exact(tmp_path):
@@ -187,12 +180,25 @@ def test_export_import_round_trip_is_exact(tmp_path):
     uid = record["goal_uid"]
     source.add_tasks(uid, ["one"])
     source.set_task_status(uid, "one", "doing")
+    source.set_plan(uid, "# PLAN v1\n\n1. [doing] one")
     document = source.export_document(uid)
+    assert document["format"] == "clip-harness/goal-export@2"
+    assert document["plan"] == "# PLAN v1\n\n1. [doing] one"
+    assert document["tasks"] == [{"title": "one", "status": "doing"}]
+    assert "tasks" not in document["goal"]  # the goal is slim
 
     target = GoalLedger(tmp_path / "other-state")
     imported = target.import_document(document)
-    assert imported == [target.get(uid)]
-    assert imported[0] == source.get(uid)  # every field, verbatim
+    assert imported[0]["goal_uid"] == uid
+    # Re-exporting the import reproduces the document exactly
+    # (modulo the export timestamp): goal fields, tasks and plan
+    # all carried. Task ids are NOT carried — tasks are recreated
+    # as fresh objects in the new store.
+    again = target.export_document(uid)
+    assert {k: v for k, v in again.items() if k != "exported_at"} \
+        == {k: v for k, v in document.items() if k != "exported_at"}
+    source_task_id = source.get(uid)["tasks"][0]["task_id"]
+    assert imported[0]["tasks"][0]["task_id"] != source_task_id
 
 
 def test_import_refuses_existing_uid_and_bad_documents(tmp_path):
@@ -202,7 +208,7 @@ def test_import_refuses_existing_uid_and_bad_documents(tmp_path):
         ledger.import_document(NAV_DOCUMENT)
     assert NAV_UID in str(caught.value)  # the refusal names the uid
     with pytest.raises(GoalStoreError):
-        ledger.import_document({"schema": "nope", "goal": {}})
+        ledger.import_document({"format": "nope", "goal": {}})
     broken = json.loads(json.dumps(NAV_DOCUMENT))
     broken["goal"]["goal_uid"] = "aaaaaaaa-1111-4111-8111-111111111111"
     broken["goal"]["status"] = "bogus"
@@ -210,6 +216,20 @@ def test_import_refuses_existing_uid_and_bad_documents(tmp_path):
         ledger.import_document(broken)
     # The failed imports changed nothing.
     assert [g["goal_uid"] for g in ledger.list_goals()] == [NAV_UID]
+
+
+def test_import_rejects_retired_v1_documents(tmp_path):
+    """@1 support is dropped outright (it never carried real
+    data): the error names the situation and points at @2."""
+    ledger = _ledger(tmp_path)
+    v1 = {"schema": "clip-harness/goal-export@1",
+          "goal": {"goal_uid": NAV_UID}}
+    with pytest.raises(GoalStoreError) as caught:
+        ledger.import_document(v1)
+    message = str(caught.value)
+    assert "goal-export@1" in message and "retired" in message
+    assert "goal-export@2" in message
+    assert ledger.list_goals() == []
 
 
 def test_export_all_and_multi_import(tmp_path):
@@ -220,6 +240,53 @@ def test_export_all_and_multi_import(tmp_path):
     assert len(document["goals"]) == 2
     target = GoalLedger(tmp_path / "elsewhere")
     assert len(target.import_document(document)) == 2
+
+
+# -- plan: a document, authored and replaced whole ------------------------------
+
+
+def test_plan_set_replaces_whole_document(tmp_path):
+    ledger = _ledger(tmp_path)
+    state = tmp_path / "state"
+    uid = ledger.create_goal("Planned")["goal_uid"]
+    assert ledger.get_plan(uid) is None
+    assert ledger.get(uid)["plan"] is None
+
+    record = ledger.set_plan(uid, "# PLAN v1\n\n1. [open] first")
+    assert record["revision"] == 2  # plan-set is a goal mutation
+    assert record["plan"] == "# PLAN v1\n\n1. [open] first"
+    # The document lives at its file home, verbatim (+ the file's
+    # one trailing newline).
+    plan_file = state / "goals" / uid / "plan.md"
+    assert plan_file.read_text(encoding="utf-8") \
+        == "# PLAN v1\n\n1. [open] first\n"
+    # Replacement is whole: no trace of v1 survives a v2.
+    record = ledger.set_plan(uid, "# PLAN v2\n\nfree-form prose, "
+                                  "no steps at all")
+    assert record["revision"] == 3
+    assert ledger.get_plan(uid) == "# PLAN v2\n\nfree-form prose, " \
+                                   "no steps at all"
+    # The harness never parses it: arbitrary markdown round-trips.
+    weird = "# T\n\n- [ ] not a step\n\n```\ncode\n```\n\ntrailing  "
+    ledger.set_plan(uid, weird)
+    assert ledger.get_plan(uid) == weird.rstrip("\n")
+
+
+def test_plan_set_refuses_empty_and_honors_guards(tmp_path):
+    ledger = _ledger(tmp_path)
+    uid = ledger.create_goal("Guarded plan")["goal_uid"]
+    with pytest.raises(GoalStoreError):
+        ledger.set_plan(uid, "   \n  ")
+    assert ledger.get(uid)["revision"] == 1  # nothing happened
+    with pytest.raises(StaleRevision):
+        ledger.set_plan(uid, "# PLAN v1", expect_revision=7)
+    action_id = str(uuid.uuid4())
+    ledger.set_plan(uid, "# PLAN v1", action_id=action_id,
+                    outcome="plan set")
+    with pytest.raises(DuplicateAction) as caught:
+        ledger.set_plan(uid, "# PLAN v2", action_id=action_id)
+    assert "plan set" in caught.value.outcome
+    assert ledger.get_plan(uid) == "# PLAN v1"  # the replay lost
 
 
 # -- legacy migration -----------------------------------------------------------
@@ -272,14 +339,15 @@ def _construct_ledger_barriered(state_dir: str, barrier, queue) -> None:
 
 
 def test_concurrent_first_construction_races_safely(tmp_path):
-    """Regression (release gates 0.2.0/0.2.1, E2E case 33): two
-    processes constructing a GoalLedger on one FRESH state dir at
-    the same instant. The WAL pragma refused the busy timeout
-    (loser died with "database is locked" before its run started),
-    and the migration marker check sat outside its transaction
-    (loser died on the marker's UNIQUE constraint, or double-
-    imported). Barrier-synchronized construction must now succeed
-    in both processes, with the legacy goal imported exactly once.
+    """Regression (release gates 0.2.0/0.2.1, E2E case 33; retargeted
+    to the file store in 0.3.0): two processes constructing the
+    store on one FRESH state dir at the same instant. In the SQLite
+    era the loser died at startup (WAL pragma / migration marker
+    races); on files the hazard is a double migration import.
+    Barrier-synchronized construction must succeed in both
+    processes, with the legacy goal imported exactly once — the
+    migration runs under the store lock and the loser finds
+    nothing left to migrate.
     """
     import multiprocessing as mp
 
@@ -302,6 +370,184 @@ def test_concurrent_first_construction_races_safely(tmp_path):
         ledger = GoalLedger(state)
         assert [r["goal"] for r in ledger.list_goals()] == ["Race goal"]
         assert (state / "goals" / "race-work.json.migrated").exists()
+
+
+def _task_update_barriered(state_dir: str, uid: str, title: str,
+                           barrier, queue) -> None:
+    try:
+        ledger = GoalLedger(state_dir)
+        barrier.wait(timeout=15)
+        ledger.apply_task_transitions(
+            uid, [{"status": "done", "title": title}])
+        queue.put("")
+    except Exception as exc:  # reported to the parent for assertion
+        queue.put(f"{type(exc).__name__}: {exc}")
+
+
+def test_concurrent_task_updates_lose_nothing(tmp_path):
+    """Two processes task-update DIFFERENT tasks of the SAME goal
+    at the same instant: the per-goal lock serializes the
+    mutations — both apply, the revision advances by exactly 2,
+    and neither update is lost."""
+    import multiprocessing as mp
+
+    state = tmp_path / "state"
+    ledger = GoalLedger(state)
+    uid = ledger.create_goal("Shared goal")["goal_uid"]
+    ledger.add_tasks(uid, ["task a", "task b"])  # revision 2
+    barrier = mp.Barrier(2)
+    queue = mp.Queue()
+    procs = [mp.Process(target=_task_update_barriered,
+                        args=(str(state), uid, title, barrier, queue))
+             for title in ("task a", "task b")]
+    for proc in procs:
+        proc.start()
+    errors = [queue.get(timeout=30) for _ in range(2)]
+    for proc in procs:
+        proc.join(timeout=30)
+    assert errors == ["", ""]
+    record = GoalLedger(state).get(uid)
+    assert record["revision"] == 4  # 2 (setup) + 2 (one per update)
+    assert {t["title"]: t["status"] for t in record["tasks"]} \
+        == {"task a": "done", "task b": "done"}
+
+
+# -- the 0.2.x SQLite ledger migration ------------------------------------------
+
+
+def _seed_sqlite_ledger(state: Path) -> None:
+    """A 0.2.x goals.db, built with the old schema (from git
+    history — the fused record with plan/tasks/backlog columns)."""
+    import sqlite3
+
+    state.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(state / "goals.db"))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(
+            """
+            CREATE TABLE meta (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE goals (
+                goal_uid TEXT PRIMARY KEY,
+                human_id TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                status TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                plan TEXT,
+                tasks TEXT NOT NULL,
+                backlog TEXT NOT NULL,
+                latest_result TEXT NOT NULL DEFAULT '',
+                parent_uid TEXT,
+                fork_revision INTEGER,
+                provenance TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL);
+            CREATE TABLE session_bindings (
+                session_id TEXT PRIMARY KEY,
+                goal_uid TEXT NOT NULL,
+                bound_at TEXT NOT NULL);
+            CREATE TABLE applied_actions (
+                scope TEXT NOT NULL,
+                action_id TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                PRIMARY KEY (scope, action_id));
+            """)
+        plan = {"revision_label": "PLAN v2",
+                "steps": [
+                    {"n": 1, "title": "Inventory repositories",
+                     "status": "done"},
+                    {"n": 2, "title": "Extract code facts",
+                     "status": "doing"}],
+                "current_step": 2}
+        conn.execute(
+            "INSERT INTO goals (goal_uid, human_id, goal, status, "
+            "revision, plan, tasks, backlog, latest_result, "
+            "parent_uid, fork_revision, provenance, created_at, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?)",
+            (NAV_UID, "velocity-navigator", "Build the Navigator",
+             "active", 2, json.dumps(plan),
+             json.dumps([{"title": "Supplier discovery",
+                          "status": "doing"}]),
+             json.dumps(["Backstage spike", "Maven supplier"]),
+             "discovery complete", None, None,
+             json.dumps({"session": "velocity-navigator"}),
+             "2026-10-12T09:00:00-0400", "2026-10-19T17:42:00-0400"))
+        conn.execute(
+            "INSERT INTO session_bindings VALUES (?, ?, ?)",
+            ("velocity-navigator", NAV_UID, "2026-10-12T09:01:00-0400"))
+        conn.execute(
+            "INSERT INTO applied_actions VALUES (?, ?, ?, ?)",
+            (NAV_UID, "cccccccc-0000-4000-8000-000000000003",
+             "2026-10-19T17:42:00-0400", "task-update applied"))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_sqlite_ledger_migrates_to_files(tmp_path):
+    state = tmp_path / "state"
+    _seed_sqlite_ledger(state)
+    ledger = GoalLedger(state)
+    goal_dir = state / "goals" / NAV_UID
+    # The file layout exists; the database is retired.
+    assert (goal_dir / "goal.json").exists()
+    assert not (state / "goals.db").exists()
+    assert (state / "goals.db.migrated").exists()
+    record = ledger.get(NAV_UID)
+    assert record["goal"] == "Build the Navigator"
+    assert record["revision"] == 2
+    assert record["latest_result"] == "discovery complete"
+    # Tasks became task files; backlog entries follow as open
+    # tasks, in order.
+    assert [(t["title"], t["status"], t["position"])
+            for t in record["tasks"]] == [
+        ("Supplier discovery", "doing", 1),
+        ("Backstage spike", "open", 2),
+        ("Maven supplier", "open", 3)]
+    assert len(list((goal_dir / "tasks").glob("*.json"))) == 3
+    # The plan dict was RENDERED to a document: title line from
+    # the revision label, one rendered line per step.
+    assert record["plan"] == (
+        "# PLAN v2\n\n"
+        "1. [done] Inventory repositories\n"
+        "2. [doing] Extract code facts")
+    assert (goal_dir / "plan.md").exists()
+    # The binding and the applied action-id carried over: the
+    # session still resolves, and the replay guard still bites.
+    assert ledger.bound_uid("velocity-navigator") == NAV_UID
+    assert ledger.action_outcome(
+        [NAV_UID], "cccccccc-0000-4000-8000-000000000003") \
+        == "task-update applied"
+    assert any(note.get("goal_uid") == NAV_UID
+               for note in ledger.migration_notes)
+    # A second open is a no-op: nothing re-migrates, nothing moves.
+    again = GoalLedger(state)
+    assert again.migration_notes == []
+    assert again.get(NAV_UID)["revision"] == 2
+
+
+def test_sqlite_and_legacy_migration_dedupes_by_binding(tmp_path):
+    """Both stores present: the SQLite ledger migrates first; a
+    legacy session file whose session is already bound is skipped
+    (still renamed — never re-read), not double-imported."""
+    state = tmp_path / "state"
+    _seed_sqlite_ledger(state)
+    _write_legacy(state, "velocity-navigator",
+                  {"goal": {"title": "Stale legacy copy",
+                            "status": "active"},
+                   "tasks": [{"title": "old", "status": "open"}]})
+    _write_legacy(state, "solo-legacy",
+                  {"goal": {"title": "Solo legacy", "status": "active"},
+                   "tasks": []})
+    ledger = GoalLedger(state)
+    goals = {g["human_id"] for g in ledger.list_goals()}
+    assert goals == {"velocity-navigator", "solo-legacy"}
+    assert not (state / "goals" / "velocity-navigator.json").exists()
+    assert (state / "goals"
+            / "velocity-navigator.json.migrated").exists()
 
 
 # -- parser: the new headers -----------------------------------------------------
@@ -392,13 +638,16 @@ def test_goal_header_binds_shell_run_and_footer_projects(make_runner,
     block = outcome.result_block
     assert "Build the Velocity Navigator" in block
     assert "(33476ec7)" in block
-    # The plan projects a [step] line between [goal] and [open tasks].
+    # The footer is exactly two lines — [goal] then [open tasks].
+    # There is NO [step] line (0.3.0 removed the stored current
+    # step); the in-progress task shows as [doing] in [open tasks].
     lines = block.rstrip().splitlines()
     if lines and lines[-1] == "```":
         lines = lines[:-1]
-    assert lines[-3].startswith("[goal] ")
-    assert lines[-2].startswith("[step] 5 — OpenAPI supplier:")
+    assert lines[-2].startswith("[goal] ")
     assert lines[-1].startswith("[open tasks] ")
+    assert "[doing] Normalize canonical contracts" in lines[-1]
+    assert "[step]" not in block
 
 
 def test_unknown_goal_header_denies_shell_run(make_runner):
@@ -413,9 +662,12 @@ def test_unknown_goal_header_denies_shell_run(make_runner):
     assert executor.calls == []
 
 
-def test_no_plan_no_step_line(make_runner):
+def test_footer_never_has_a_step_line(make_runner):
     runner = make_runner()
     _goal_set(runner)
+    runner.process_text(
+        "```shell\nsession: work\naction: plan-set\n"
+        "# PLAN v1\n\n1. [doing] The only step\n```", "/tmp")
     outcome = runner.process_text(
         "```shell\nsession: work\necho hi\n```", "/tmp")
     assert "[step]" not in outcome.result_block
@@ -434,17 +686,25 @@ def test_goal_list_and_show_discover_after_session_loss(make_runner,
     assert listed.state == RunState.COMPLETED
     assert NAV_UID in listed.result_block
     assert "velocity-navigator · active · rev 2" in listed.result_block
-    assert "step 5: OpenAPI supplier" in listed.result_block
     shown = runner.process_text(
         f"```shell\nsession: fresh-eyes\naction: goal-show\n"
         f"goal: {NAV_UID}\n```", "/tmp")
     block = shown.result_block
-    for needle in ("PLAN v2", "current step 5",
-                   "Run Joern code-fact extraction",
-                   "Backstage adapter spike",
-                   "unaccounted = 0", "revision: 2",
-                   "m365 harness"):
+    # goal-show reconciles the goal and its tasks, and POINTS at
+    # the plan (its title line) without embedding the document.
+    for needle in ("PLAN v2", "Add the Kustomize supplier",
+                   "unaccounted = 0", "revision: 2", "m365 harness"):
         assert needle in block, f"{needle!r} missing from:\n{block}"
+    assert "Run Joern code-fact extraction" not in block
+    # The document itself comes back verbatim via plan-show.
+    plan = runner.process_text(
+        f"```shell\nsession: fresh-eyes\naction: plan-show\n"
+        f"goal: {NAV_UID}\n```", "/tmp")
+    assert NAV_PLAN in plan.result_block
+    for needle in ("Run Joern code-fact extraction",
+                   "Gradle supplier discovery",
+                   "Helm supplier discovery"):
+        assert needle in plan.result_block
     # Discovery is read-only: the record is untouched.
     assert GoalLedger(tmp_path / "state").get(NAV_UID)["revision"] == 2
     # No session at all also works for the read-only ops.
@@ -452,6 +712,41 @@ def test_goal_list_and_show_discover_after_session_loss(make_runner,
                                "/tmp")
     assert anon.state == RunState.COMPLETED
     assert NAV_UID in anon.result_block
+
+
+def test_plan_actions_through_runner(make_runner, tmp_path):
+    runner = make_runner()
+    _goal_set(runner)  # session "work", revision 1
+    # plan-show on a goal with no plan says so, plainly.
+    shown = runner.process_text(
+        "```shell\nsession: work\naction: plan-show\n```", "/tmp")
+    assert "has no plan" in shown.result_block
+    # plan-set authors the document whole; it is a goal mutation.
+    document = "# PLAN v1\n\nSome prose.\n\n- a bullet, not a step"
+    set_outcome = runner.process_text(
+        f"```shell\nsession: work\naction: plan-set\n{document}\n```",
+        "/tmp")
+    assert "plan set: # PLAN v1" in set_outcome.result_block
+    assert "revision 2" in set_outcome.result_block
+    # goal-show points at the document; plan-show returns it.
+    shown = runner.process_text(
+        "```shell\nsession: work\naction: goal-show\n```", "/tmp")
+    assert "plan: # PLAN v1" in shown.result_block
+    assert "a bullet, not a step" not in shown.result_block
+    plan = runner.process_text(
+        "```shell\nsession: work\naction: plan-show\n```", "/tmp")
+    assert document in plan.result_block
+    # Replacing is whole, and the guards ride along: the stale
+    # expectation is rejected and the old document survives.
+    stale = runner.process_text(
+        "```shell\nsession: work\naction: plan-set\n"
+        "expect-revision: 1\n# PLAN v2\n```", "/tmp")
+    assert "stale revision: expected 1" in stale.result_block
+    plan = runner.process_text(
+        "```shell\nsession: work\naction: plan-show\n```", "/tmp")
+    assert document in plan.result_block
+    assert GoalLedger(tmp_path / "state").goal_for_session(
+        "work")["revision"] == 2
 
 
 def test_goal_show_unknown_uid_renders_not_denies(make_runner):
@@ -546,8 +841,9 @@ def test_acceptance_navigator_goal(make_runner, tmp_path):
     ledger = GoalLedger(state)
     ledger.import_document(NAV_DOCUMENT)
     unrelated = ledger.create_goal("Unrelated goal", session_id="other")
-    unrelated_before = ledger.export_document(
-        unrelated["goal_uid"])["goal"]
+    unrelated_before = {
+        k: v for k, v in ledger.export_document(
+            unrelated["goal_uid"]).items() if k != "exported_at"}
 
     executor = FakeExecutor()
     runner = make_runner(executor=executor)
@@ -561,13 +857,19 @@ def test_acceptance_navigator_goal(make_runner, tmp_path):
     shown = runner.process_text(
         f"```shell\nsession: brand-new\naction: goal-show\n"
         f"goal: {NAV_UID}\n```", "/tmp")
-    for needle in ("PLAN v2", "current step 5",
-                   "Run Joern code-fact extraction",      # Joern done
-                   "Gradle supplier discovery",           # Gradle done
-                   "Helm supplier discovery",             # Helm done
-                   "Backstage adapter spike",             # backlog
-                   "revision: 2"):
+    for needle in ("PLAN v2", "revision: 2"):
         assert needle in shown.result_block, needle
+    # The plan document comes back verbatim via plan-show — every
+    # completion the old record asserted is in it (Joern, Gradle,
+    # Helm all done inside PLAN v2).
+    plan = runner.process_text(
+        f"```shell\nsession: brand-new\naction: plan-show\n"
+        f"goal: {NAV_UID}\n```", "/tmp")
+    assert NAV_PLAN in plan.result_block
+    for needle in ("Run Joern code-fact extraction",      # Joern done
+                   "Gradle supplier discovery",           # Gradle done
+                   "Helm supplier discovery"):            # Helm done
+        assert needle in plan.result_block, needle
 
     # The revision-guarded update: expect 2 -> applies -> revision 3.
     action_id = "aaaaaaaa-0000-4000-8000-000000000001"
@@ -611,7 +913,9 @@ def test_acceptance_navigator_goal(make_runner, tmp_path):
         "Add the Kustomize supplier"] == "doing"  # not reopened
 
     # Nothing ever executed, and the unrelated goal is byte-identical
-    # (field-for-field) throughout.
+    # (its whole export document, field-for-field) throughout.
     assert executor.calls == []
-    assert GoalLedger(state).export_document(
-        unrelated["goal_uid"])["goal"] == unrelated_before
+    unrelated_after = {
+        k: v for k, v in GoalLedger(state).export_document(
+            unrelated["goal_uid"]).items() if k != "exported_at"}
+    assert unrelated_after == unrelated_before

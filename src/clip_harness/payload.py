@@ -35,8 +35,11 @@ A copied message is ONE payload made of fences:
         `payload.transitions` — the batch the goal store validates
         and applies atomically, or not at all. Malformed transition
         lines fail closed, like malformed header metadata. The
-        read-only `goal-list` / `goal-show` actions are header-only:
-        no body at all.
+        read-only `goal-list` / `goal-show` / `plan-show` actions
+        are header-only: no body at all. An `action: plan-set`
+        payload's body is the whole Markdown plan document,
+        carried verbatim — it is data, never shell text, and
+        nothing in it is parsed.
 
     ```file
     path: src/auth.py
@@ -123,7 +126,7 @@ _HEADER_LINE = re.compile(
 # command — exempt from the "empty command" errors in both parse
 # paths (the fenced empty-command check and the unfenced
 # metadata-without-a-command check).
-_BODILESS_ACTIONS = ("goal-list", "goal-show")
+_BODILESS_ACTIONS = ("goal-list", "goal-show", "plan-show")
 _PATH_LINE = re.compile(r"^path\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _OP_LINE = re.compile(r"^op\s*:\s*(create|update|delete|auto)\s*$", re.IGNORECASE)
 _OP_ATTEMPT = re.compile(r"^op\s*:", re.IGNORECASE)

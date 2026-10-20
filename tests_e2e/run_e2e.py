@@ -1720,8 +1720,21 @@ def case_61(env: Env):
 
 NAV_UID = "33476ec7-1cfd-4634-93d6-ab22dde10b23"
 
+NAV_PLAN = (
+    "# PLAN v2\n"
+    "\n"
+    "1. [done] Inventory the platform repositories\n"
+    "2. [done] Run Joern code-fact extraction\n"
+    "3. [done] Gradle supplier discovery with complete candidate "
+    "accounting\n"
+    "4. [done] Helm supplier discovery with complete candidate "
+    "accounting\n"
+    "5. [doing] OpenAPI supplier: normalize canonical contracts "
+    "and HTTP operations into generic units\n"
+    "6. [open] Reconcile suppliers into the canonical model")
+
 NAV_EXPORT = {
-    "schema": "clip-harness/goal-export@1",
+    "format": "clip-harness/goal-export@2",
     "exported_at": "2026-10-20T10:15:00-0400",
     "goal": {
         "goal_uid": NAV_UID,
@@ -1731,45 +1744,20 @@ NAV_EXPORT = {
                 "platform repositories",
         "status": "active",
         "revision": 2,
-        "plan": {
-            "revision_label": "PLAN v2",
-            "steps": [
-                {"n": 1, "title": "Inventory the platform repositories",
-                 "status": "done"},
-                {"n": 2, "title": "Run Joern code-fact extraction",
-                 "status": "done"},
-                {"n": 3, "title": "Gradle supplier discovery with "
-                                  "complete candidate accounting",
-                 "status": "done"},
-                {"n": 4, "title": "Helm supplier discovery with "
-                                  "complete candidate accounting",
-                 "status": "done"},
-                {"n": 5, "title": "OpenAPI supplier: normalize "
-                                  "canonical contracts and HTTP "
-                                  "operations into generic units",
-                 "status": "doing"},
-                {"n": 6, "title": "Reconcile suppliers into the "
-                                  "canonical model",
-                 "status": "open"},
-            ],
-            "current_step": 5,
-        },
-        "tasks": [
-            {"title": "Normalize canonical contracts and HTTP "
-                      "operations into generic units",
-             "status": "doing"},
-            {"title": "Add the Kustomize supplier", "status": "open"},
-        ],
-        "backlog": ["Backstage adapter spike", "Maven supplier"],
         "latest_result": "OpenAPI discovery complete: every "
                          "candidate accounted — unaccounted = 0",
-        "parent_uid": None,
-        "fork_revision": None,
         "provenance": {"imported_from": "m365 harness (SQLite "
                                         "ledger)"},
         "created_at": "2026-10-12T09:00:00-0400",
         "updated_at": "2026-10-19T17:42:00-0400",
     },
+    "tasks": [
+        {"title": "Normalize canonical contracts and HTTP "
+                  "operations into generic units",
+         "status": "doing"},
+        {"title": "Add the Kustomize supplier", "status": "open"},
+    ],
+    "plan": NAV_PLAN,
 }
 
 
@@ -1786,7 +1774,8 @@ def case_62(env: Env):
     # rejected, action-id replay rejected, unrelated goal untouched.
     env.cli("goal", "--session", "other", "set", "Unrelated goal")
     unrelated_before = [g for g in _export_all(env)
-                        if g["human_id"] == "unrelated-goal"][0]
+                        if g["goal"]["human_id"]
+                        == "unrelated-goal"][0]
 
     export_path = env.proj / "nav-export.json"
     export_path.write_text(json.dumps(NAV_EXPORT), encoding="utf-8")
@@ -1801,9 +1790,11 @@ def case_62(env: Env):
           f"{proc.stderr!r}")
 
     # Total session loss: the sessions registry is destroyed. The
-    # durable store (goals.db) is all that survives — by design.
+    # durable file store (goals/<uid>/goal.json) is all that
+    # survives — by design.
     shutil.rmtree(env.state / "sessions", ignore_errors=True)
-    check((env.state / "goals.db").exists(), "goals.db missing")
+    check((env.state / "goals" / NAV_UID / "goal.json").exists(),
+          "goal.json missing from the file store")
 
     proc = env.cli("goal", "list")
     check(NAV_UID in proc.stdout and "rev 2" in proc.stdout,
@@ -1815,11 +1806,21 @@ def case_62(env: Env):
     env.run_payload(f"```shell\nsession: fresh-eyes\n"
                     f"action: goal-show\ngoal: {NAV_UID}\n```")
     block = env.clip_text()
-    for needle in ("PLAN v2", "current step 5",
-                   "Run Joern code-fact extraction",
-                   "Backstage adapter spike", "revision: 2"):
+    # goal-show reconciles the goal and points at the plan (its
+    # title line) — the document itself is NOT embedded.
+    for needle in ("PLAN v2", "revision: 2",
+                   "Add the Kustomize supplier"):
         check(needle in block, f"goal-show missing {needle!r}: "
                                f"{block!r}")
+    check("Run Joern code-fact extraction" not in block,
+          f"goal-show embedded the plan document: {block!r}")
+    # plan-show returns the document verbatim.
+    env.run_payload(f"```shell\nsession: fresh-eyes\n"
+                    f"action: plan-show\ngoal: {NAV_UID}\n```")
+    block = env.clip_text()
+    check(NAV_PLAN in block,
+          f"plan-show did not return the document verbatim: "
+          f"{block!r}")
 
     action_id = "aaaaaaaa-0000-4000-8000-000000000001"
     payload = (f"```shell\nsession: fresh-eyes\ngoal: {NAV_UID}\n"
@@ -1856,7 +1857,8 @@ def case_62(env: Env):
           f"record moved under rejected writes: {proc.stdout!r}")
 
     unrelated_after = [g for g in _export_all(env)
-                       if g["human_id"] == "unrelated-goal"][0]
+                       if g["goal"]["human_id"]
+                       == "unrelated-goal"][0]
     check(unrelated_after == unrelated_before,
           "unrelated goal changed during the acceptance run")
 
@@ -1883,7 +1885,10 @@ def case_63(env: Env):
     check(not (legacy_dir / "leg63.json").exists()
           and (legacy_dir / "leg63.json.migrated").exists(),
           "legacy file was not renamed .migrated")
-    check((env.state / "goals.db").exists(), "goals.db not created")
+    check(list((env.state / "goals").glob("*/goal.json")),
+          "no goal folder created by the migration")
+    check((env.state / "bindings" / "leg63.json").exists(),
+          "session binding file missing")
     proc = env.cli("goal", "--session", "leg63", "show")
     check("Migrated goal" in proc.stdout
           and "goal_uid:" in proc.stdout,
@@ -1907,6 +1912,8 @@ def case_64(env: Env):
           f"[update] line duplicated: {block!r}")
     check(block.index(line) < block.index("[goal]"),
           f"[update] line is not before the footer: {block!r}")
+    check("[step]" not in block,
+          f"a [step] line survived the 0.3.0 footer: {block!r}")
 
 
 def case_65(env: Env):
@@ -1939,6 +1946,112 @@ def case_66(env: Env):
           f"upgrade failed: {proc.stdout!r} {proc.stderr!r}")
     check("already the latest release" in proc.stdout,
           f"upgrade did not report already-latest: {proc.stdout!r}")
+
+
+def case_67(env: Env):
+    # Recreation through payloads: the create vocabulary is now
+    # lossless — a goal that exists only as payloads (goal-set +
+    # plan-set + task-add + task-update) is fully reproducible,
+    # with no import involved. This is the path that replaces the
+    # old import-bridge-over-a-hole.
+    env.run_payload("```shell\nsession: rec67\n"
+                    "action: goal-set\nRecreated goal\n```")
+    env.run_payload("```shell\nsession: rec67\n"
+                    "action: task-add\nfirst task\nsecond task\n"
+                    "```")
+    plan_doc = "# PLAN v1\n\nProse plan, steps as tasks only."
+    env.run_payload(f"```shell\nsession: rec67\n"
+                    f"action: plan-set\n{plan_doc}\n```")
+    env.run_payload("```shell\nsession: rec67\n"
+                    "action: task-update\n"
+                    "doing: first task\n```")
+    block = env.clip_text()
+    check("[doing] first task" in block
+          and "[step]" not in block,
+          f"footer wrong after recreation: {block!r}")
+    bundles = _export_all(env)
+    bundle = [g for g in bundles
+              if g["goal"]["human_id"] == "recreated-goal"][0]
+    check(bundle["plan"] == plan_doc,
+          f"plan did not survive recreation: {bundle!r}")
+    check(bundle["tasks"] == [
+        {"title": "first task", "status": "doing"},
+        {"title": "second task", "status": "open"}],
+        f"tasks did not survive recreation: {bundle!r}")
+    # goal created (rev 1) + task-add (2) + plan-set (3)
+    # + task-update (4).
+    check(bundle["goal"]["revision"] == 4,
+          f"revision accounting wrong: {bundle!r}")
+
+
+def case_68(env: Env):
+    # The 0.2.x SQLite ledger migrates to the file store on first
+    # contact: goals/tasks/backlog/plan/bindings/actions land in
+    # files, the database is renamed .migrated and never re-read.
+    import sqlite3
+
+    uid = "22222222-3333-4444-8555-666666666666"
+    conn = sqlite3.connect(str(env.state / "goals.db"))
+    try:
+        conn.executescript(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, "
+            "value TEXT NOT NULL);"
+            "CREATE TABLE goals (goal_uid TEXT PRIMARY KEY, "
+            "human_id TEXT NOT NULL, goal TEXT NOT NULL, "
+            "status TEXT NOT NULL, revision INTEGER NOT NULL, "
+            "plan TEXT, tasks TEXT NOT NULL, "
+            "backlog TEXT NOT NULL, "
+            "latest_result TEXT NOT NULL DEFAULT '', "
+            "parent_uid TEXT, fork_revision INTEGER, "
+            "provenance TEXT NOT NULL, created_at TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL);"
+            "CREATE TABLE session_bindings ("
+            "session_id TEXT PRIMARY KEY, goal_uid TEXT NOT NULL, "
+            "bound_at TEXT NOT NULL);"
+            "CREATE TABLE applied_actions (scope TEXT NOT NULL, "
+            "action_id TEXT NOT NULL, applied_at TEXT NOT NULL, "
+            "outcome TEXT NOT NULL, "
+            "PRIMARY KEY (scope, action_id));")
+        plan = {"revision_label": "PLAN v9",
+                "steps": [{"n": 1, "title": "Seeded step",
+                           "status": "doing"}],
+                "current_step": 1}
+        conn.execute(
+            "INSERT INTO goals (goal_uid, human_id, goal, status, "
+            "revision, plan, tasks, backlog, latest_result, "
+            "parent_uid, fork_revision, provenance, created_at, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?)",
+            (uid, "seeded-goal", "Seeded from SQLite", "active", 5,
+             json.dumps(plan),
+             json.dumps([{"title": "seeded task",
+                          "status": "open"}]),
+             json.dumps(["seeded backlog"]), "", None, None,
+             json.dumps({}), "2026-10-01T00:00:00-0400",
+             "2026-10-02T00:00:00-0400"))
+        conn.execute("INSERT INTO session_bindings VALUES "
+                     "(?, ?, ?)", ("seed68", uid,
+                                   "2026-10-01T00:01:00-0400"))
+        conn.commit()
+    finally:
+        conn.close()
+    env.run_payload("```shell\nsession: seed68\necho hi\n```")
+    block = env.clip_text()
+    check("Seeded from SQLite" in block,
+          f"migrated goal not projected: {block!r}")
+    goal_dir = env.state / "goals" / uid
+    check((goal_dir / "goal.json").exists()
+          and (goal_dir / "plan.md").exists(),
+          "file layout incomplete after SQLite migration")
+    check("# PLAN v9" in (goal_dir / "plan.md").read_text(
+        encoding="utf-8"), "plan document not rendered")
+    check(not (env.state / "goals.db").exists()
+          and (env.state / "goals.db.migrated").exists(),
+          "goals.db was not retired to .migrated")
+    proc = env.cli("goal", "show", uid)
+    check("revision: 5" in proc.stdout
+          and "[open] seeded backlog" in proc.stdout,
+          f"migrated record wrong: {proc.stdout!r}")
 
 
 # =======================================================================

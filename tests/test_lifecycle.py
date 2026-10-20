@@ -4,6 +4,7 @@ headless adapters only (memory clipboard, fake/local executors)."""
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 import time
@@ -707,11 +708,15 @@ def test_bound_result_carries_goal_section_with_zero_hooks(make_runner):
     assert "[open] update tests" in outcome.result_block
     assert "old task" not in outcome.result_block  # done tasks drop off
     # Sticky footer: the [goal]/[open tasks] pair is the last section
-    # of the block (just inside the closing fence, when fenced).
+    # of the block (just inside the closing fence, when fenced). The
+    # [goal] line is projected from the durable record and carries
+    # its short uid.
     lines = outcome.result_block.rstrip().splitlines()
     if lines and lines[-1] == "```":
         lines = lines[:-1]
-    assert lines[-2] == "[goal] Ship the auth refactor [active]"
+    assert re.fullmatch(
+        r"\[goal\] Ship the auth refactor \[active\] \([0-9a-f]{8}\)",
+        lines[-2]), lines[-2]
     assert lines[-1].startswith("[open tasks] ")
 
 

@@ -139,22 +139,23 @@ def test_store_noop_reset_is_valid(tmp_path):
 
 def test_store_unknown_title_rejects_everything(tmp_path):
     store = _store(tmp_path, [("a", "open"), ("b", "open")])
-    before = store.path.read_bytes()
+    before = store.record()
     applied, errors = store.apply_task_transitions([
         {"status": "done", "title": "a"},
         {"status": "done", "title": "ghost"},
     ])
     assert applied == []
     assert errors == [{"title": "ghost", "problem": "unknown"}]
-    # Atomic: the store file is byte-identical, valid entry included.
-    assert store.path.read_bytes() == before
+    # Atomic: the durable record is untouched — same tasks, same
+    # revision, same timestamps; the valid entry did not leak through.
+    assert store.record() == before
     assert {t["title"]: t["status"] for t in store.tasks()} == {
         "a": "open", "b": "open"}
 
 
 def test_store_duplicate_and_conflicting_titles(tmp_path):
     store = _store(tmp_path, [("a", "open"), ("b", "open")])
-    before = store.path.read_bytes()
+    before = store.record()
     _, errors = store.apply_task_transitions([
         {"status": "done", "title": "a"},
         {"status": "done", "title": "a"},
@@ -165,7 +166,7 @@ def test_store_duplicate_and_conflicting_titles(tmp_path):
         {"status": "doing", "title": "b"},
     ])
     assert errors == [{"title": "b", "problem": "conflicting"}]
-    assert store.path.read_bytes() == before
+    assert store.record() == before
 
 
 # -- runner: the acceptance case, atomic rejects, the migration ---------------
@@ -244,7 +245,7 @@ def test_batch_with_unknown_title_applies_nothing(make_runner,
     runner = make_runner(executor=executor)
     _seed_session(runner, session="atomic")
     store = GoalStore(tmp_path / "state", "atomic")
-    before = store.path.read_bytes()
+    before = store.record()
     outcome = runner.process_text(
         "```shell\nsession: atomic\naction: task-update\n"
         "done: Implement generic OpenAPI discovery with complete "
@@ -255,7 +256,7 @@ def test_batch_with_unknown_title_applies_nothing(make_runner,
     assert "task-update rejected — nothing applied" in block
     assert "unknown task: No such task" in block
     # The valid transition in the same batch did NOT apply.
-    assert store.path.read_bytes() == before
+    assert store.record() == before
     entries = runner.ledger.entries(run_id=outcome.run_id)
     receipt = [e for e in entries
                if e["event"] == "PostRun"][0]["data"]["tool_response"]
@@ -282,7 +283,7 @@ def test_removed_actions_get_migration_error(make_runner, tmp_path,
     runner = make_runner(executor=executor)
     _seed_session(runner, session="mig")
     store = GoalStore(tmp_path / "state", "mig")
-    before = store.path.read_bytes()
+    before = store.record()
     outcome = runner.process_text(
         f"```shell\nsession: mig\naction: {removed}\n"
         "Write the conformance report\n```", "/tmp")
@@ -291,7 +292,7 @@ def test_removed_actions_get_migration_error(make_runner, tmp_path,
     block = outcome.result_block
     assert f"action '{removed}' was removed" in block
     assert "'task-update'" in block
-    assert store.path.read_bytes() == before
+    assert store.record() == before
 
 
 def test_unfenced_batch_runs_nothing(make_runner):

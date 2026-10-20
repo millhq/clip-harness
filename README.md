@@ -94,7 +94,8 @@ Two consequences worth naming:
 | `runner` | the lifecycle state machine |
 | `sessions` | the session registry (binding, cancel/rerun addressing) |
 | `receipts` | the JSONL ledger + markdown transcript |
-| `goals` | the core goal/task store |
+| `goals` | the session-bound view over the durable goal store |
+| `goalstore` | the durable goal ledger: SQLite store, revisions, CAS, action-id idempotency, export/import, legacy migration |
 | `manifest` | the capability manifest (built-ins + hook-registered tools) |
 | `settings` | user/project settings, merged Claude Code-style |
 | `executor` | the local subprocess backend |
@@ -151,14 +152,16 @@ text. Recognised keys:
   never blocks execution.
 - `action:` — `run` (default); the core goal/task operations
   `goal-set`, `goal-status`, `task-add`, `task-update` (these
-  require a session). `task-update` is the only status-change form:
-  its body is one `<status>: <exact task title>` line per transition
-  (status `done` / `doing` / `open`), and the batch applies
-  atomically — every title is validated first, and an unknown,
-  duplicated or conflicting title rejects the whole batch with
-  nothing applied. (Migration: the single-task `task-doing` /
-  `task-done` / `task-open` actions were removed; a payload naming
-  one gets a static migration error pointing at `task-update`.)
+  require a session, or a `goal:` header) and the read-only
+  `goal-list` / `goal-show` (no session needed). `task-update` is
+  the only status-change form: its body is one
+  `<status>: <exact task title>` line per transition (status
+  `done` / `doing` / `open`), and the batch applies atomically —
+  every title is validated first, and an unknown, duplicated or
+  conflicting title rejects the whole batch with nothing applied.
+  (Migration: the single-task `task-doing` / `task-done` /
+  `task-open` actions were removed; a payload naming one gets a
+  static migration error pointing at `task-update`.)
 - `cwd:` — working directory override.
 - `timeout:` — per-command timeout in seconds.
 - `attend:` — `true` opts this run into attended mode (below);
@@ -168,6 +171,19 @@ text. Recognised keys:
   declaration scopes the sandbox when the command is held for
   review (see *Reviewed shell commands* below); an empty value is
   malformed and fails closed.
+- `goal:` — a durable goal's `goal_uid`: binds the payload to that
+  goal (its footer projects from the goal's record; goal/task
+  actions target it). An unknown uid is refused — discover goals
+  with `action: goal-list`. See *Durable goals* below.
+- `expect-revision:` — the compare-and-swap guard: an integer. A
+  goal mutation proceeds only while the goal's current revision
+  equals it (a stale writer is rejected, naming both revisions);
+  on a plain run bound to a goal it asserts the revision, and a
+  mismatch denies the run. A non-integer value is malformed.
+- `action-id:` — an idempotency key (a uuid) for the whole
+  payload. If the id was already applied, the payload is rejected
+  as a duplicate — before anything executes or mutates — with the
+  original outcome named. An empty value is malformed.
 
 (```run is accepted as a legacy alias for ```shell.)
 
@@ -377,7 +393,7 @@ files:
     +new line
 — capabilities:
   ...
-[goal] Ship the auth refactor [active]
+[goal] Ship the auth refactor [active] (3f9a1c2e)
 [open tasks] [doing] wire tokens · [open] update tests
 ```
 ````
@@ -396,13 +412,17 @@ version and no separate machine version.
   (80 lines / 6000 chars) with a `… N more lines — full diff in
   <candidate dir>` pointer.
 - **Sticky footer.** Every session-bound block ENDS with the same
-  two lines in the same position: `[goal] …` then `[open tasks] …`.
-  The footer is **core-generated** (never hook-supplied) and appears
-  in every bound block, hooks or no hooks, so both the human and the
-  model are re-anchored on the goal and the open tasks every round
-  trip. Hook `additionalContext`, capability-manifest refreshes, and
+  lines in the same position: `[goal] …` then `[open tasks] …`.
+  The `[goal]` line is projected from the durable goal record —
+  goal text, status, and the goal's short uid — and a goal with a
+  plan inserts a `[step] …` line between the two. The footer is
+  **core-generated** (never hook-supplied) and appears in every
+  bound block, hooks or no hooks, so both the human and the model
+  are re-anchored on the goal and the open tasks every round trip.
+  Hook `additionalContext`, capability-manifest refreshes, and
   pending state all sit *above* the footer; the footer is always
-  last. Unbound runs carry neither the footer nor manifest refreshes.
+  last. Unbound runs carry neither the footer nor manifest
+  refreshes.
 - A rejection puts plain rejection text on the clipboard instead
   (the rejected diffs included, marked rejected, with the reason),
   ready to paste back so the model can re-propose.
@@ -424,23 +444,79 @@ is lost and no re-run is needed: the model pages the stored file with
 ordinary shell commands in a follow-up payload, so the bulk never
 occupies its context — it stays addressable instead.
 
-## Goal/task state (core)
+## Durable goals (core)
 
-Per-session goal + task store, in the spirit of `goal-create/list/
-show/status/update`:
+Goals are **durable objects**, not session state — the shape
+Anthropic's task system converged on: an object with a stable id,
+referenced by sessions, never owned by them. The store is a SQLite
+database at `<state_dir>/goals.db` (stdlib `sqlite3`, WAL mode,
+one transaction per mutation; still zero third-party
+dependencies).
+
+A goal record carries: `goal_uid` (harness-issued uuid4, immutable,
+never derived from the session name or the goal text), `human_id`
+(a readable slug), the verbatim goal text, `status` (`waiting` /
+`active` / `paused` / `complete` / `branched`), `revision`
+(starts at 1, +1 on every mutation), an optional `plan`
+(`{revision_label, steps: [{n, title, status}], current_step}`),
+`tasks`, `backlog`, `latest_result`, `parent_uid` /
+`fork_revision` (preserved fields only — there are no branch
+operations), free-form `provenance`, and timestamps. Sessions hold
+only a **binding** (session id → goal_uid): lose the chat, the
+terminal and the session, and the goal is still there —
+`goal-list` rediscovers it, `goal-show` reconciles it, by exact
+uid.
+
+Two guards ride the mutations:
+
+- **Compare-and-swap.** A payload carrying `expect-revision: N`
+  mutates the goal only while its revision is N; a stale writer is
+  rejected with both revisions named and nothing applied.
+- **Idempotency.** A payload carrying `action-id: <uuid>` that was
+  already applied is rejected as a duplicate before anything
+  executes or mutates, with the original outcome named. Action ids
+  are scoped per goal when a goal is involved, then per session,
+  then global.
+
+From the terminal:
 
 ```sh
 clip-harness goal --session auth-refactor set "Ship the auth refactor"
 clip-harness goal --session auth-refactor task-add "wire tokens"
 clip-harness goal --session auth-refactor task-update "wire tokens" doing
-clip-harness goal --session auth-refactor show
+clip-harness goal --session auth-refactor show          # the bound goal
+clip-harness goal list                                  # every durable goal
+clip-harness goal show <goal_uid>                       # one goal, in full
+clip-harness goal export <goal_uid>                     # JSON, to stdout
+clip-harness goal export --all --out backup.json
+clip-harness goal import backup.json
 ```
 
-…or from the chat side, via `action:` payloads (see the manifest):
-tasks are created with `task-add`, and their statuses change only
-through `task-update` — one atomic batch of
-`<status>: <exact task title>` lines per payload.
-State is stored per session under the state dir and survives restarts.
+From the chat side, via `action:` payloads (see the manifest):
+the first `goal-set` in a session creates the durable goal and
+returns its `goal_uid` in the result block; tasks are created with
+`task-add` and their statuses change only through `task-update` —
+one atomic batch of `<status>: <exact task title>` lines per
+payload. `goal-list` / `goal-show` are the read-only discovery
+pair. Every bound result block's sticky footer projects from the
+durable record (session state never overrides it).
+
+**Export / backup / migration.** `goal export` writes a versioned
+JSON document (`{"schema": "clip-harness/goal-export@1", "goal":
+{…record…}}`, or `"goals": […]` with `--all`) — that document IS
+the backup format and the import format: `goal import` validates
+it, preserves uid, revision, status, plan, tasks, backlog,
+provenance and timestamps exactly, and refuses to overwrite an
+existing `goal_uid` (the refusal names it). This is also the
+migration path from the old M365 harness: export its goal record
+into this shape and import it once.
+
+**One-time storage migration.** Pre-0.2.0 installs kept goal/task
+state in per-session JSON files under `<state_dir>/goals/`. On
+first run under the new code each such file is imported into the
+durable store (fresh uid, the session binding recorded, legacy
+status `done` → `complete`), receipted, and renamed with a
+`.migrated` suffix — preserved on disk, never read again.
 
 ## Capability manifest
 
@@ -448,8 +524,8 @@ The manifest is the discovery mechanism by which the chat model gains
 capabilities over the clipboard transport: a compact list of the
 tools it may invoke, each with the block shape that invokes it
 (`shell.run`, `file.write`, `file.edit`, `patch.apply`,
-`session.cancel`, `session.rerun`, `goal.set`, `task.add`,
-`task.update`, …). The core
+`session.cancel`, `session.rerun`, `goal.set`, `goal.list`,
+`goal.show`, `task.add`, `task.update`, …). The core
 generates it for the built-ins; settings may declare more under
 `"tools"`; and **hooks may register additional tools at runtime** via
 `registeredTools` in their output — a registered tool appears in the
@@ -652,8 +728,9 @@ project. See [examples/settings.example.json](examples/settings.example.json).
 }
 ```
 
-State (receipts, sessions, candidates, goals) lives in
-`~/.local/state/clip-harness` (override with `"state_dir"`).
+State (receipts, sessions, candidates, and the durable goal
+ledger `goals.db`) lives in `~/.local/state/clip-harness`
+(override with `"state_dir"`).
 
 **Terminal color.** Diffs printed to a terminal — the review
 presentation, `candidate show`, printed result blocks — are colorized
@@ -673,6 +750,7 @@ clip-harness run (--clipboard|--stdin|--file F|--command C) [--session ID]
 clip-harness hook --event PreRun  # the hook dispatcher (JSON in/out)
 clip-harness init                 # default hooks + starter settings
 clip-harness goal --session ID set|show|status|task-add|task-update|task-list
+clip-harness goal list|show UID|export [UID|--all]|import FILE
 clip-harness candidate list|show|review|decide|apply [ID]
 clip-harness sessions             # bound sessions
 clip-harness cancel [ID]          # bound id, or the last run

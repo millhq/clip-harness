@@ -45,9 +45,22 @@ These are the tools you may invoke, and the block shape for each:
   Shape: a single line `` ```cancel``` ``, optionally `id=<session>`.
 - **session.rerun** — re-run a session's last payload.
   Shape: a single line `` ```rerun``` ``, optionally `id=<session>`.
-- **goal.set** — set the session's active goal.
+- **goal.set** — set the active goal. Goals are DURABLE: the
+  first goal-set creates one with a harness-issued `goal_uid`
+  (returned in the result block) and binds the session to it; the
+  goal outlives the session.
   Shape: a ```shell fence with header `action: goal-set`.
-- **task.add** — add open tasks to the session.
+- **goal.list** — list every durable goal (uid, status, revision,
+  current plan step). Read-only; use it to rediscover a goal after
+  losing the chat or session.
+  Shape: a ```shell fence with header `action: goal-list`, no body,
+  no session needed.
+- **goal.show** — show one durable goal in full: goal text, plan +
+  steps with statuses, tasks, backlog, latest result, revision,
+  provenance. Read-only.
+  Shape: a ```shell fence with headers `action: goal-show` and
+  `goal: <goal_uid>` (or the session's bound goal).
+- **task.add** — add open tasks to the bound durable goal.
   Shape: a ```shell fence with header `action: task-add`, one task
   per body line.
 - **task.update** — change task statuses, in one atomic batch.
@@ -70,9 +83,20 @@ npm test
 
 - The first lines may be a metadata header of `key: value` lines.
   Recognised keys: `session`, `action`, `cwd`, `timeout`, `attend`,
-  `writes`. Everything after the header is shell text, run with the
-  user's shell in `cwd` (default: wherever the harness was
-  triggered).
+  `writes`, `goal`, `expect-revision`, `action-id`. Everything
+  after the header is shell text, run with the user's shell in
+  `cwd` (default: wherever the harness was triggered).
+- `goal: <goal_uid>` binds the payload to a durable goal (see
+  "Durable goals" below): goal/task actions target it, and the
+  footer projects from its record. An unknown uid is refused.
+- `expect-revision: <int>` is the compare-and-swap guard: if the
+  bound goal's current revision differs, the whole payload is
+  rejected naming expected vs current revision — re-read with
+  `action: goal-show` and re-send.
+- `action-id: <uuid>` makes the payload replay-safe: give each
+  logical action a fresh uuid; if the id was already applied, the
+  payload is rejected as a duplicate before anything executes.
+  Always set one on a mutation you might have to retry.
 - `writes:` declares, comma-separated, the paths your command may
   write (relative entries resolve against the effective `cwd`).
   Declare it **honestly and completely** on any command that writes
@@ -215,11 +239,49 @@ Rules:
   trigger wait inline for the decision. If a payload also has
   commands, the commands run only after the files are accepted.
 
-## Goal and task operations
+## Durable goals and task operations
 
-Goal/task state is how you avoid drifting: the harness shows the
-active goal and open tasks back to you in **every** bound result
-block. Maintain it:
+Goals are **durable objects**, not session state. Each goal has a
+harness-issued `goal_uid` that never changes; a session only
+*binds* to a goal. The harness shows the bound goal and its open
+tasks back to you in **every** bound result block — and the goal
+survives the chat. Lose the session entirely and the recovery is:
+`action: goal-list` to rediscover the uid, then `action: goal-show`
+with `goal: <goal_uid>` to reconcile (plan, current step, tasks,
+backlog, revision) before doing anything else.
+
+Every goal carries a `revision` that increments on each mutation,
+and statuses `waiting` / `active` / `paused` / `complete` (set with
+`action: goal-status`). Two headers guard your writes when it
+matters: `expect-revision:` (only mutate if the goal is still at
+the revision you read) and `action-id:` (a retry of an applied
+payload is rejected as a duplicate instead of applying twice).
+
+Worked example — resuming the Navigator goal in a brand-new chat,
+then finishing a task against the revision you just read:
+
+````
+```shell
+action: goal-show
+goal: 33476ec7-1cfd-4634-93d6-ab22dde10b23
+```
+→ [goal] "…" · status: active · revision: 2 · plan: PLAN v2 · current step 5 …
+
+```shell
+session: navigator-resume
+goal: 33476ec7-1cfd-4634-93d6-ab22dde10b23
+action: task-update
+expect-revision: 2
+action-id: 9b2f2f9c-2c6f-4d3a-9f41-2f0d1c7a0001
+done: Normalize canonical contracts and HTTP operations into generic units
+```
+→ applies, goal now at revision 3. Re-send the same payload and
+it is rejected as a duplicate; send it with a fresh action-id but
+the stale `expect-revision: 2` and it is rejected as stale.
+Neither rejection changes anything.
+````
+
+Maintain the state as you work:
 
 ````
 ```shell
@@ -243,17 +305,19 @@ doing: Normalize canonical contracts and HTTP operations into generic units
 ```
 ````
 
-Set the goal once when work starts; add tasks as you plan them with
-`task-add`. Change a task's status ONLY with `task-update` — the one
-canonical form for status changes: a single payload carrying every
-transition, one `done:` / `doing:` / `open:` line per task, titles
-exact. The batch is **atomic**: every title is checked against the
-session's tasks first, and if any title is unknown, duplicated or
-conflicting, **nothing is applied** and the result block names each
-problem — fix the batch and re-send it whole. Re-setting a task to
-the status it already has is a valid no-op, so re-sending a batch is
-safe. These operations require a `session:` header — they are
-anchored to the session.
+Set the goal once when work starts — the result block tells you
+the new `goal_uid`; note it. Add tasks as you plan them with
+`task-add`. Change a task's status ONLY with `task-update` — the
+one canonical form for status changes: a single payload carrying
+every transition, one `done:` / `doing:` / `open:` line per task,
+titles exact. The batch is **atomic**: every title is checked
+against the goal's tasks first, and if any title is unknown,
+duplicated or conflicting, **nothing is applied** and the result
+block names each problem — fix the batch and re-send it whole.
+Re-setting a task to the status it already has is a valid no-op,
+so re-sending a batch is safe. These operations need a `session:`
+header (the session's bound goal) or a `goal:` header naming the
+goal directly.
 
 ## Reading result blocks
 
@@ -275,7 +339,7 @@ files:
     +++ b/src/tokens.py
     @@ -0,0 +1 @@
     +fresh content
-[goal] Ship the auth refactor [active]
+[goal] Ship the auth refactor [active] (3f9a1c2e)
 [open tasks] [doing] Wire the token endpoint · [open] Update the session tests
 ```
 ````
@@ -299,10 +363,13 @@ files:
   directory for the full diff) — exactly as it was rendered to the
   human. The block you receive is byte-for-byte the block the human
   saw in the terminal.
-- The block always ENDS with the sticky footer: a `[goal]` line then
-  an `[open tasks]` line, standing context generated by the harness.
-  Treat it as current truth about what you're supposed to be doing;
-  if it disagrees with your plan, fix the state with the goal/task
+- The block always ENDS with the sticky footer: a `[goal]` line —
+  goal text, status, and the goal's short uid in parentheses —
+  then an `[open tasks]` line. When the goal has a plan, a
+  `[step] N — <title>` line sits between them. The footer is
+  projected from the durable goal record by the harness; treat it
+  as current truth about what you're supposed to be doing. If it
+  disagrees with your plan, fix the state with the goal/task
   operations above rather than ignoring it.
 - A `— capabilities:` section appears when your available tools have
   changed (see the manifest above).

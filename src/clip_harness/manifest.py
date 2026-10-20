@@ -29,7 +29,8 @@ BUILTIN_TOOLS: list[dict] = [
                        "there — the block names the file holding the "
                        "full output; page it, don't re-run.",
         "shape": "```shell fence; header lines session:/action:/cwd:/"
-                 "timeout:/attend:, then the commands",
+                 "timeout:/attend:/writes:/goal:/expect-revision:/"
+                 "action-id:, then the commands",
     },
     {
         "name": "file.write",
@@ -74,22 +75,47 @@ BUILTIN_TOOLS: list[dict] = [
     },
     {
         "name": "goal.set",
-        "description": "Set the session's active goal (shown back in "
-                       "every bound result block).",
+        "description": "Set the active goal. Goals are DURABLE: the "
+                       "first goal-set creates a goal with a "
+                       "harness-issued goal_uid (returned in the "
+                       "result) and binds the session to it; the goal "
+                       "outlives the session and is shown back in "
+                       "every bound result block.",
         "shape": "```shell fence with header `action: goal-set` and "
                  "`session: <id>`; body = the goal title",
     },
     {
+        "name": "goal.list",
+        "description": "List every durable goal (goal_uid, id, "
+                       "status, revision, current plan step). "
+                       "Read-only — use it to rediscover a goal "
+                       "after losing the chat or session.",
+        "shape": "```shell fence with header `action: goal-list` "
+                 "(no body, no session needed)",
+    },
+    {
+        "name": "goal.show",
+        "description": "Show one durable goal in full: goal text, "
+                       "plan + steps, tasks, backlog, latest result, "
+                       "revision, provenance. Read-only.",
+        "shape": "```shell fence with headers `action: goal-show` "
+                 "and `goal: <goal_uid>` (or the session's bound "
+                 "goal when no `goal:` header is given)",
+    },
+    {
         "name": "task.add",
-        "description": "Add open tasks to the session (shown back in "
-                       "every bound result block).",
+        "description": "Add open tasks to the bound durable goal "
+                       "(shown back in every bound result block).",
         "shape": "```shell fence with header `action: task-add` and "
                  "`session: <id>`; one task per body line",
     },
     {
         "name": "task.update",
         "description": "Change task statuses in ONE atomic batch: "
-                       "every transition applies, or none does.",
+                       "every transition applies, or none does. "
+                       "Guard it with `expect-revision:` (the goal's "
+                       "current revision) and make it replay-safe "
+                       "with a unique `action-id:`.",
         "shape": "```shell fence with header `action: task-update` "
                  "and `session: <id>`; one `<status>: <exact task "
                  "title>` line per transition, status done/doing/open",

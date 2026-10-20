@@ -11,7 +11,7 @@ hit the trigger, exactly like the old hotkey-run tool.
 
 Subcommands exist for everything else: watch, run, the hook
 dispatcher, the review gate (candidate/apply), sessions, the core
-goal/task store, receipts, and init (install the default hooks).
+durable goal store, receipts, and init (install the default hooks).
 """
 
 from __future__ import annotations
@@ -29,6 +29,8 @@ from .core import Event
 from .gate import CommandCandidate, DecisionRecord, load_candidate, \
     read_decision, write_decision
 from .goals import GoalStore
+from .goalstore import (GoalLedger, GoalStoreError, render_goal_list,
+                        render_goal_show)
 from .hooks import dispatch
 from .payload import Payload
 from .receipts import Ledger
@@ -270,32 +272,87 @@ def cmd_init(args) -> int:
 
 def cmd_goal(args) -> int:
     settings = load_settings()
+    ledger = GoalLedger(settings.state_dir)
+    # -- durable-store commands (no session anchor) --------------------
+    if args.goal_cmd == "list":
+        print(render_goal_list(ledger.list_goals()))
+        return 0
+    if args.goal_cmd == "export":
+        try:
+            if args.all:
+                document = ledger.export_all_document()
+            elif args.uid:
+                document = ledger.export_document(args.uid)
+            else:
+                print("clip-harness: export needs a goal_uid or --all",
+                      file=sys.stderr)
+                return 1
+        except GoalStoreError as exc:
+            print(f"clip-harness: {exc}", file=sys.stderr)
+            return 1
+        text = json.dumps(document, indent=2, ensure_ascii=False)
+        if args.out:
+            Path(args.out).write_text(text + "\n", encoding="utf-8")
+            print(f"exported to {args.out}")
+        else:
+            print(text)
+        return 0
+    if args.goal_cmd == "import":
+        try:
+            document = json.loads(
+                Path(args.file).read_text(encoding="utf-8"))
+            records = ledger.import_document(document)
+        except (OSError, json.JSONDecodeError, GoalStoreError) as exc:
+            print(f"clip-harness: import failed: {exc}",
+                  file=sys.stderr)
+            return 1
+        for record in records:
+            print(f"imported goal {record['goal_uid']} "
+                  f"({record['human_id']}) at revision "
+                  f"{record['revision']}")
+        return 0
+    # -- session-bound view ---------------------------------------------
     store = GoalStore(settings.state_dir, args.session)
-    if args.goal_cmd == "set":
-        goal = store.set_goal(args.title)
-        print(f"goal set [{args.session}]: {goal['title']}")
-    elif args.goal_cmd == "show":
-        goal = store.goal()
-        print(f"goal [{args.session}]: "
-              f"{goal['title']} [{goal['status']}]" if goal
-              else f"goal [{args.session}]: (none set)")
-        for task in store.tasks():
-            print(f"  [{task['status']}] {task['title']}")
-    elif args.goal_cmd == "status":
-        goal = store.set_goal_status(args.status)
-        print(f"goal status [{args.session}]: {goal['status']}"
-              if goal else "no goal set")
-    elif args.goal_cmd == "task-add":
-        task = store.add_task(args.title)
-        print(f"task added [{args.session}]: {task['title']}")
-    elif args.goal_cmd == "task-update":
-        task = store.set_task_status(args.title, args.status)
-        print(f"task [{args.session}]: {task['title']} -> {task['status']}"
-              if task else f"task not found: {args.title}")
-        return 0 if task else 1
-    elif args.goal_cmd == "task-list":
-        for task in store.tasks():
-            print(f"[{task['status']}] {task['title']}")
+    try:
+        if args.goal_cmd == "set":
+            goal = store.set_goal(args.title)
+            print(f"goal set [{args.session}]: {goal['title']}")
+            print(f"  goal_uid: {goal['uid']} · revision "
+                  f"{goal['revision']}")
+        elif args.goal_cmd == "show":
+            if args.uid:
+                print(render_goal_show(ledger.get(args.uid), args.uid))
+                return 0
+            goal = store.goal()
+            print(f"goal [{args.session}]: "
+                  f"{goal['title']} [{goal['status']}]" if goal
+                  else f"goal [{args.session}]: (none set)")
+            if goal:
+                print(f"  goal_uid: {goal['uid']} · revision "
+                      f"{goal['revision']}")
+            for task in store.tasks():
+                print(f"  [{task['status']}] {task['title']}")
+        elif args.goal_cmd == "status":
+            goal = store.set_goal_status(args.status)
+            print(f"goal status [{args.session}]: {goal['status']}"
+                  if goal else "no goal set")
+            if goal is None:
+                return 1
+        elif args.goal_cmd == "task-add":
+            task = store.add_task(args.title)
+            print(f"task added [{args.session}]: {task['title']}")
+        elif args.goal_cmd == "task-update":
+            task = store.set_task_status(args.title, args.status)
+            print(f"task [{args.session}]: {task['title']} -> "
+                  f"{task['status']}"
+                  if task else f"task not found: {args.title}")
+            return 0 if task else 1
+        elif args.goal_cmd == "task-list":
+            for task in store.tasks():
+                print(f"[{task['status']}] {task['title']}")
+    except GoalStoreError as exc:
+        print(f"clip-harness: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -516,16 +573,26 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--config-dir")
     init.set_defaults(fn=cmd_init)
 
-    goal = sub.add_parser("goal", help="core goal/task store")
+    goal = sub.add_parser("goal", help="durable goal store")
     goal.add_argument("--session", default=DEFAULT_SESSION)
     gsub = goal.add_subparsers(dest="goal_cmd", required=True)
     g = gsub.add_parser("set"); g.add_argument("title")
-    gsub.add_parser("show")
+    g = gsub.add_parser("show")
+    g.add_argument("uid", nargs="?",
+                   help="goal_uid to show (default: the session's "
+                        "bound goal)")
     g = gsub.add_parser("status"); g.add_argument("status")
     g = gsub.add_parser("task-add"); g.add_argument("title")
     g = gsub.add_parser("task-update")
     g.add_argument("title"); g.add_argument("status")
     gsub.add_parser("task-list")
+    gsub.add_parser("list", help="list all durable goals")
+    g = gsub.add_parser("export", help="export goal(s) as JSON")
+    g.add_argument("uid", nargs="?")
+    g.add_argument("--all", action="store_true")
+    g.add_argument("--out", help="write to this file instead of stdout")
+    g = gsub.add_parser("import", help="import an export document")
+    g.add_argument("file")
     goal.set_defaults(fn=cmd_goal)
 
     cand = sub.add_parser("candidate", help="review gate candidates")

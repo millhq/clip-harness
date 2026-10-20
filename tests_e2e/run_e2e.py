@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -793,7 +794,9 @@ def case_30(env: Env):
 # Sessions, goals, manifest (31-35)
 # =======================================================================
 
-FOOTER_GOAL = re.compile(r"^\[goal\] .+ \[active\]$")
+FOOTER_GOAL = re.compile(
+    r"^\[goal\] .+ \[(waiting|active|paused|complete|branched)\] "
+    r"\([0-9a-f]{8}\)$")
 FOOTER_TASKS = re.compile(r"^\[open tasks\] .+$")
 
 
@@ -815,18 +818,24 @@ def case_31(env: Env):
     env.cli("goal", "--session", "s31", "set", "Ship the thing")
     env.cli("goal", "--session", "s31", "task-add", "alpha task")
     env.cli("goal", "--session", "s31", "task-add", "beta task")
+    goal_uids = []
     for i in (1, 2):
         proc = env.run_payload(
             f"```shell\nsession: s31\necho run-{i}\n```")
         check(proc.returncode == 0, proc.stderr)
         block = env.clip_text()
         goal_line, tasks_line = _check_footer(block, f"run {i}")
-        check(goal_line == "[goal] Ship the thing [active]",
-              f"run {i}: footer goal wrong: {goal_line!r}")
+        match = re.fullmatch(
+            r"\[goal\] Ship the thing \[active\] \(([0-9a-f]{8})\)",
+            goal_line)
+        check(match, f"run {i}: footer goal wrong: {goal_line!r}")
+        goal_uids.append(match.group(1))
         check(tasks_line == "[open tasks] [open] alpha task · "
               "[open] beta task",
               f"run {i}: footer tasks wrong: {tasks_line!r}")
         artifact_check(env, proc, f"(case 31 run {i})")
+    check(goal_uids[0] == goal_uids[1],
+          "the durable goal's short uid changed between runs")
     # Shape is stable and the footer updates when the state changes.
     env.cli("goal", "--session", "s31", "task-update", "alpha task",
             "done")
@@ -846,7 +855,9 @@ def case_32(env: Env):
                     "first job\nsecond job\n```")
     env.run_payload("```shell\nsession: s32\necho after\n```")
     goal_line, tasks_line = _check_footer(env.clip_text(), "after ops")
-    check(goal_line == "[goal] Migrate the jobs [active]",
+    check(re.fullmatch(
+        r"\[goal\] Migrate the jobs \[active\] \([0-9a-f]{8}\)",
+        goal_line),
           f"goal-set not reflected: {goal_line!r}")
     check("[open] first job" in tasks_line
           and "[open] second job" in tasks_line,
@@ -1023,7 +1034,9 @@ def case_41(env: Env):
     check(block.index("+after") < block.index("[goal]"),
           "the diff must sit above the sticky footer")
     goal_line, _ = _check_footer(block, "case 41")
-    check(goal_line == "[goal] Diff positioning [active]",
+    check(re.fullmatch(
+        r"\[goal\] Diff positioning \[active\] \([0-9a-f]{8}\)",
+        goal_line),
           f"footer wrong: {goal_line!r}")
 
 
@@ -1679,6 +1692,178 @@ def case_61(env: Env):
     check("-    return 'hello'" in block
           and "+    return 'hello, world'" in block,
           f"harness-generated diff missing from block: {block!r}")
+
+
+NAV_UID = "33476ec7-1cfd-4634-93d6-ab22dde10b23"
+
+NAV_EXPORT = {
+    "schema": "clip-harness/goal-export@1",
+    "exported_at": "2026-10-20T10:15:00-0400",
+    "goal": {
+        "goal_uid": NAV_UID,
+        "human_id": "velocity-navigator",
+        "goal": "Build the Velocity Navigator: a discovery-first, "
+                "offline repository navigator over the Tangerine "
+                "platform repositories",
+        "status": "active",
+        "revision": 2,
+        "plan": {
+            "revision_label": "PLAN v2",
+            "steps": [
+                {"n": 1, "title": "Inventory the platform repositories",
+                 "status": "done"},
+                {"n": 2, "title": "Run Joern code-fact extraction",
+                 "status": "done"},
+                {"n": 3, "title": "Gradle supplier discovery with "
+                                  "complete candidate accounting",
+                 "status": "done"},
+                {"n": 4, "title": "Helm supplier discovery with "
+                                  "complete candidate accounting",
+                 "status": "done"},
+                {"n": 5, "title": "OpenAPI supplier: normalize "
+                                  "canonical contracts and HTTP "
+                                  "operations into generic units",
+                 "status": "doing"},
+                {"n": 6, "title": "Reconcile suppliers into the "
+                                  "canonical model",
+                 "status": "open"},
+            ],
+            "current_step": 5,
+        },
+        "tasks": [
+            {"title": "Normalize canonical contracts and HTTP "
+                      "operations into generic units",
+             "status": "doing"},
+            {"title": "Add the Kustomize supplier", "status": "open"},
+        ],
+        "backlog": ["Backstage adapter spike", "Maven supplier"],
+        "latest_result": "OpenAPI discovery complete: every "
+                         "candidate accounted — unaccounted = 0",
+        "parent_uid": None,
+        "fork_revision": None,
+        "provenance": {"imported_from": "m365 harness (SQLite "
+                                        "ledger)"},
+        "created_at": "2026-10-12T09:00:00-0400",
+        "updated_at": "2026-10-19T17:42:00-0400",
+    },
+}
+
+
+def _export_all(env: Env) -> list[dict]:
+    proc = env.cli("goal", "export", "--all")
+    check(proc.returncode == 0, proc.stderr)
+    return json.loads(proc.stdout)["goals"]
+
+
+def case_62(env: Env):
+    # The durable-goal acceptance case through the real CLI: import
+    # the M365 goal at revision 2, lose every session, discover by
+    # list, resume by uid, guarded update -> revision 3, stale retry
+    # rejected, action-id replay rejected, unrelated goal untouched.
+    env.cli("goal", "--session", "other", "set", "Unrelated goal")
+    unrelated_before = [g for g in _export_all(env)
+                        if g["human_id"] == "unrelated-goal"][0]
+
+    export_path = env.proj / "nav-export.json"
+    export_path.write_text(json.dumps(NAV_EXPORT), encoding="utf-8")
+    proc = env.cli("goal", "import", str(export_path))
+    check(proc.returncode == 0, proc.stderr)
+    check(NAV_UID in proc.stdout and "revision 2" in proc.stdout,
+          f"import output wrong: {proc.stdout!r}")
+    # A second import of the same uid is refused, by name.
+    proc = env.cli("goal", "import", str(export_path))
+    check(proc.returncode == 1 and NAV_UID in proc.stderr,
+          f"duplicate import not refused: {proc.stdout!r} "
+          f"{proc.stderr!r}")
+
+    # Total session loss: the sessions registry is destroyed. The
+    # durable store (goals.db) is all that survives — by design.
+    shutil.rmtree(env.state / "sessions", ignore_errors=True)
+    check((env.state / "goals.db").exists(), "goals.db missing")
+
+    proc = env.cli("goal", "list")
+    check(NAV_UID in proc.stdout and "rev 2" in proc.stdout,
+          f"goal list does not rediscover the goal: {proc.stdout!r}")
+    env.run_payload("```shell\nsession: fresh-eyes\n"
+                    "action: goal-list\n```")
+    check(NAV_UID in env.clip_text(),
+          f"payload goal-list lost the goal: {env.clip_text()!r}")
+    env.run_payload(f"```shell\nsession: fresh-eyes\n"
+                    f"action: goal-show\ngoal: {NAV_UID}\n```")
+    block = env.clip_text()
+    for needle in ("PLAN v2", "current step 5",
+                   "Run Joern code-fact extraction",
+                   "Backstage adapter spike", "revision: 2"):
+        check(needle in block, f"goal-show missing {needle!r}: "
+                               f"{block!r}")
+
+    action_id = "aaaaaaaa-0000-4000-8000-000000000001"
+    payload = (f"```shell\nsession: fresh-eyes\ngoal: {NAV_UID}\n"
+               f"action: task-update\nexpect-revision: 2\n"
+               f"action-id: {action_id}\n"
+               "done: Normalize canonical contracts and HTTP "
+               "operations into generic units\n"
+               "doing: Add the Kustomize supplier\n```")
+    env.run_payload(payload)
+    block = env.clip_text()
+    check("task done: Normalize canonical contracts" in block,
+          f"guarded update did not apply: {block!r}")
+    proc = env.cli("goal", "show", NAV_UID)
+    check("revision: 3" in proc.stdout,
+          f"revision did not land at 3: {proc.stdout!r}")
+
+    # Replay of the applied payload: duplicate, nothing changes.
+    env.run_payload(payload)
+    check("duplicate action-id" in env.clip_text(),
+          f"replay was not caught: {env.clip_text()!r}")
+    # Fresh action id, stale expectation: rejected, nothing changes.
+    env.run_payload(
+        f"```shell\nsession: fresh-eyes\ngoal: {NAV_UID}\n"
+        "action: task-update\nexpect-revision: 2\n"
+        "action-id: bbbbbbbb-0000-4000-8000-000000000002\n"
+        "open: Add the Kustomize supplier\n```")
+    block = env.clip_text()
+    check("stale revision: expected 2" in block
+          and "current revision is 3" in block,
+          f"stale update not rejected cleanly: {block!r}")
+    proc = env.cli("goal", "show", NAV_UID)
+    check("revision: 3" in proc.stdout
+          and "[doing] Add the Kustomize supplier" in proc.stdout,
+          f"record moved under rejected writes: {proc.stdout!r}")
+
+    unrelated_after = [g for g in _export_all(env)
+                       if g["human_id"] == "unrelated-goal"][0]
+    check(unrelated_after == unrelated_before,
+          "unrelated goal changed during the acceptance run")
+
+
+def case_63(env: Env):
+    # Legacy migration through the entry point: a pre-0.2.0
+    # per-session goal file is imported into the durable store on
+    # first contact, the session binding keeps working, and the
+    # legacy file is renamed .migrated (preserved, never re-read).
+    legacy_dir = env.state / "goals"
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "leg63.json").write_text(json.dumps({
+        "goal": {"title": "Migrated goal", "status": "active"},
+        "tasks": [{"title": "legacy task", "status": "open"}]}),
+        encoding="utf-8")
+    env.run_payload("```shell\nsession: leg63\necho hi\n```")
+    block = env.clip_text()
+    match = re.search(
+        r"\[goal\] Migrated goal \[active\] \(([0-9a-f]{8})\)", block)
+    check(match, f"footer does not project the migrated goal: "
+                 f"{block!r}")
+    check("[open tasks] [open] legacy task" in block,
+          f"migrated tasks missing from footer: {block!r}")
+    check(not (legacy_dir / "leg63.json").exists()
+          and (legacy_dir / "leg63.json.migrated").exists(),
+          "legacy file was not renamed .migrated")
+    check((env.state / "goals.db").exists(), "goals.db not created")
+    proc = env.cli("goal", "--session", "leg63", "show")
+    check("Migrated goal" in proc.stdout
+          and "goal_uid:" in proc.stdout,
+          f"session show lost the migrated goal: {proc.stdout!r}")
 
 
 # =======================================================================

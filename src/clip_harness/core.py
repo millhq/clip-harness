@@ -169,6 +169,18 @@ class Payload:
     # parsed from an `action: task-update` payload's transition lines.
     # The batch applies atomically (all or nothing) in the goal store;
     # a task-update payload has no shell command.
+    goal_uid: str | None = None  # header `goal:` — binds the payload
+    # to a DURABLE goal by its goal_uid (goalstore.py). The binding
+    # is a reference, never ownership: the goal outlives the session.
+    expect_revision: int | None = None  # header `expect-revision:` —
+    # the compare-and-swap guard: a goal mutation (or a bound run)
+    # carrying it proceeds only while the durable goal's revision
+    # equals it; otherwise the payload is rejected, nothing changes.
+    action_id: str | None = None  # header `action-id:` — an
+    # idempotency key for the whole payload: an already-applied id
+    # is rejected as a duplicate before anything executes or mutates.
+    # All three headers are optional metadata — a missing header
+    # never blocks a run (the session rule, applied to goals).
 
     @property
     def bound(self) -> bool:

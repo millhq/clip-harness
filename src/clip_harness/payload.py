@@ -14,13 +14,18 @@ A copied message is ONE payload made of fences:
     ```
         Commands to run. The leading `key: value` lines are the metadata
         header; recognised keys are session, action, cwd, timeout,
-        attend, writes. The
+        attend, writes, goal, expect-revision, action-id. The
         rest of the fence is shell text. `session:` binds the run to that
         session id (addressable for cancel/rerun, receipt keyed by it);
         without it the run is unbound but still runs. `writes:` is a
         comma-separated declaration of the paths the command may write
         — it scopes the sandbox when the command is held for review;
-        an empty value is malformed (fail closed).
+        an empty value is malformed (fail closed). `goal:` binds the
+        payload to a durable goal by its goal_uid; `expect-revision:`
+        is the compare-and-swap guard on that goal's revision (a
+        non-integer value is malformed); `action-id:` is the
+        payload's idempotency key (an empty value is malformed).
+        All three are metadata: consumed here, never shell text.
 
         Goal/task action payloads (`action: goal-set` / `goal-status` /
         `task-add` / `task-update`) carry no shell text: the body is
@@ -29,7 +34,9 @@ A copied message is ONE payload made of fences:
         done / doing / open, repeatable), parsed here into
         `payload.transitions` — the batch the goal store validates
         and applies atomically, or not at all. Malformed transition
-        lines fail closed, like malformed header metadata.
+        lines fail closed, like malformed header metadata. The
+        read-only `goal-list` / `goal-show` actions are header-only:
+        no body at all.
 
     ```file
     path: src/auth.py
@@ -109,8 +116,14 @@ _FENCE_OPEN = re.compile(
 _FENCE_OPEN_COUNT = re.compile(
     r"^```(shell|run|file|patch|edit)\b", re.MULTILINE)
 _HEADER_LINE = re.compile(
-    r"^(session|action|cwd|timeout|attend|writes)\s*:\s*(.*?)\s*$",
+    r"^(session|action|cwd|timeout|attend|writes|goal|expect-revision"
+    r"|action-id)\s*:\s*(.*?)\s*$",
     re.IGNORECASE)
+# Read-only goal actions whose payload is header-only: no body, no
+# command — exempt from the "empty command" errors in both parse
+# paths (the fenced empty-command check and the unfenced
+# metadata-without-a-command check).
+_BODILESS_ACTIONS = ("goal-list", "goal-show")
 _PATH_LINE = re.compile(r"^path\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _OP_LINE = re.compile(r"^op\s*:\s*(create|update|delete|auto)\s*$", re.IGNORECASE)
 _OP_ATTEMPT = re.compile(r"^op\s*:", re.IGNORECASE)
@@ -265,6 +278,28 @@ def _parse_shell_body(body: str, fence_attrs: dict[str, str]) -> Payload:
                 "paths the command may write, comma-separated, or "
                 "omit the header")
         payload.writes = entries
+    if header.get("goal"):
+        # `goal:` binds the payload to a durable goal by goal_uid.
+        payload.goal_uid = header["goal"].strip()
+    if header.get("expect-revision"):
+        # `expect-revision:` is the compare-and-swap guard — it must
+        # be an integer; anything else is malformed metadata, never
+        # a guess (fail closed, like a bad timeout).
+        try:
+            payload.expect_revision = int(header["expect-revision"])
+        except ValueError:
+            raise PayloadError(
+                f"bad expect-revision in payload header: "
+                f"{header['expect-revision']!r} (expected an integer)")
+    if "action-id" in header:
+        # `action-id:` is the payload's idempotency key. An empty
+        # value is malformed, not "no key": fail closed, like an
+        # empty `writes:`.
+        if not header["action-id"].strip():
+            raise PayloadError(
+                "empty 'action-id:' in payload header — give the "
+                "payload a unique action id, or omit the header")
+        payload.action_id = header["action-id"].strip()
     if payload.action == "task-update":
         # The body of a task-update payload is not shell text: it is
         # the transition batch (see _parse_task_transitions). Parse
@@ -330,7 +365,8 @@ def _parse_unfenced(text: str) -> Payload | None:
     # fenced body parser cannot tell this text was never fenced.
     payload = _parse_shell_body(text, {})
     payload.raw = text
-    if not payload.command.strip() and not payload.transitions:
+    if not payload.command.strip() and not payload.transitions \
+            and payload.action not in _BODILESS_ACTIONS:
         raise PayloadError(
             "unfenced payload has a metadata header but no command")
     return payload
@@ -566,7 +602,8 @@ def parse_payload(text: str) -> Payload | None:
     payload.files = files
     payload.raw = text
     if not payload.command.strip() and not files \
-            and not payload.transitions and payload.kind == "run":
+            and not payload.transitions and payload.kind == "run" \
+            and payload.action not in _BODILESS_ACTIONS:
         raise PayloadError("run payload has an empty command")
     return payload
 

@@ -48,14 +48,22 @@ from .core import (MAX_PAYLOAD_CHARS, Decision, Event, GateVerdict, Payload,
                    RunContext, RunState, cap_output, elide_output,
                    format_result, new_run_id, now_iso, sha256_text)
 from .executor import Executor, LocalExecutor
-from .goals import GoalStore
+from .goals import (DuplicateAction, GoalStore, GoalStoreError,
+                    StaleRevision, render_section)
+from .goalstore import (GoalLedger, render_goal_list, render_goal_show)
 from .manifest import ManifestStore
 from .payload import PayloadError, parse_clipboard_text
 from .receipts import Ledger, Transcript
 from .sessions import RunHandle, SessionRegistry
 from .settings import Settings, add_project_allowlist_pattern, load_settings
 
-ACTION_OPS = {"goal-set", "goal-status", "task-add", "task-update"}
+ACTION_OPS = {"goal-set", "goal-status", "goal-list", "goal-show",
+              "task-add", "task-update"}
+
+# Goal actions that only READ the durable store: no session anchor
+# required (goal-list is global; goal-show reads the header's uid or
+# the session's bound goal), no gate, no execution.
+READONLY_GOAL_OPS = {"goal-list", "goal-show"}
 
 # Single-task status actions, removed outright (no backward compat —
 # migrate once to the latest): `task-update` replaces them. A payload
@@ -118,6 +126,7 @@ class LifecycleRunner:
         self.ledger = Ledger(self.state_dir / "receipts.jsonl")
         self.registry = SessionRegistry(self.state_dir)
         self.manifest = ManifestStore(self.state_dir)
+        self._goal_ledger: GoalLedger | None = None
         self.transcript = (Transcript(transcript_path)
                            if transcript_path else None)
         self._armed = False
@@ -137,6 +146,15 @@ class LifecycleRunner:
         tools = {name: bool(shutil.which(name)) for name in
                  ("pbpaste", "pbcopy", "code", "git", "osascript", "sh")}
         self.manifest.register(self.settings.tools)
+
+        # One-time migration of the legacy per-session goal files
+        # into the durable store (opening the ledger performs it);
+        # each migrated session is receipted so the move is auditable.
+        for note in GoalLedger(self.state_dir).migration_notes:
+            self.ledger.append(
+                "session", Event.SESSION_START.value,
+                {"status": "legacy-goal-migrated", **note},
+                session_id=self.session_id)
 
         # ConfigChange: settings edited while armed are their own events.
         hash_path = self.state_dir / "config.hash"
@@ -163,6 +181,128 @@ class LifecycleRunner:
                            session_id=self.session_id)
         self._dispatch_simple(Event.SESSION_END, str(cwd))
         return summary
+
+    # ------------------------------------------------------------------
+    # Durable goal resolution (headers: goal / expect-revision /
+    # action-id)
+    # ------------------------------------------------------------------
+
+    @property
+    def goal_ledger(self) -> GoalLedger:
+        if self._goal_ledger is None:
+            self._goal_ledger = GoalLedger(self.state_dir)
+        return self._goal_ledger
+
+    def _goal_record_for(self, payload: Payload) -> dict | None:
+        """The durable record a payload refers to: the `goal:`
+        header's uid wins; otherwise the session's bound goal."""
+        if payload.goal_uid:
+            return self.goal_ledger.get(payload.goal_uid)
+        if payload.session_id:
+            return self.goal_ledger.goal_for_session(payload.session_id)
+        return None
+
+    def _goal_scopes(self, payload: Payload) -> list[str]:
+        """Idempotency scopes for this payload, most specific first:
+        the referred goal, the payload's session, the global scope."""
+        scopes: list[str] = []
+        record = self._goal_record_for(payload)
+        if record is not None:
+            scopes.append(record["goal_uid"])
+        elif payload.goal_uid:
+            scopes.append(payload.goal_uid)
+        if payload.session_id:
+            scopes.append(f"session:{payload.session_id}")
+        scopes.append("")
+        return scopes
+
+    def _record_action_id(self, payload: Payload, outcome: str) -> None:
+        """Remember a completed payload's action id under its most
+        specific scope, so a replay is caught as a duplicate."""
+        if not payload.action_id:
+            return
+        scopes = self._goal_scopes(payload)
+        self.goal_ledger.record_action(scopes[0], payload.action_id,
+                                       outcome)
+
+    def _goal_preflight(self, ctx: RunContext, handle: RunHandle,
+                        payload: Payload) -> RunOutcome | None:
+        """The goal-header checks for NON-action payloads, run
+        before the gate: an unknown `goal:` uid is a denial (the
+        binding claim cannot be honoured); an already-applied
+        `action-id:` is a duplicate — a result block, not a denial,
+        because the action's effect is already in place; a stale
+        `expect-revision:` denies the run (the model's context is
+        out of date — fail closed rather than act on it)."""
+        if payload.goal_uid and payload.action not in READONLY_GOAL_OPS \
+                and self.goal_ledger.get(payload.goal_uid) is None:
+            return self._deny(
+                ctx, handle,
+                f"goal: header names unknown goal_uid "
+                f"{payload.goal_uid!r} — discover goals with "
+                f"'action: goal-list', or import the goal first",
+                Event.PRE_RUN)
+        if payload.action_id:
+            original = self.goal_ledger.action_outcome(
+                self._goal_scopes(payload), payload.action_id)
+            if original is not None:
+                return self._duplicate(ctx, handle, payload, original)
+        if payload.expect_revision is not None:
+            record = self._goal_record_for(payload)
+            if record is None:
+                return self._deny(
+                    ctx, handle,
+                    f"expect-revision: {payload.expect_revision} "
+                    f"cannot be verified — the payload names no "
+                    f"existing durable goal",
+                    Event.PRE_RUN)
+            if record["revision"] != payload.expect_revision:
+                return self._deny(
+                    ctx, handle,
+                    f"stale revision: expected "
+                    f"{payload.expect_revision}, goal "
+                    f"{record['goal_uid'][:8]} is at revision "
+                    f"{record['revision']} — re-read the goal "
+                    f"('action: goal-show') and re-send",
+                    Event.PRE_RUN)
+        return None
+
+    def _duplicate(self, ctx: RunContext, handle: RunHandle,
+                   payload: Payload, original_outcome: str) -> RunOutcome:
+        """An action-id replay: nothing executes, nothing mutates —
+        the result block says so and names the original outcome."""
+        run_id = ctx.run_id
+        output = (f"duplicate action-id {payload.action_id} — already "
+                  f"applied ({original_outcome}); nothing was "
+                  f"executed or changed")
+        tool_response = {"exit_desc": "0", "output": output,
+                         "duplicate_of": payload.action_id}
+        self._dispatch(Event.POST_RUN, ctx, tool_name="Session",
+                       tool_input={"action": payload.action or "run"},
+                       tool_use_id=run_id,
+                       extra={"tool_response": tool_response,
+                              "error": None, "duration_ms": 0})
+        self.ledger.append(run_id, Event.POST_RUN.value,
+                           {"status": "duplicate",
+                            "action_id": payload.action_id,
+                            "tool_response": tool_response,
+                            "duration_ms": 0},
+                           session_id=self.session_id,
+                           binding_id=payload.session_id)
+        ctx.command_executed = (payload.command
+                                or f"({payload.action or 'run'})").strip()
+        block = format_result(ctx.command_executed, output, "0", 0.0,
+                              "",
+                              standing_section=self._standing(ctx),
+                              extra_section=self._extra_section(ctx),
+                              budget=self.settings.result_budget_chars)
+        self._save_result(run_id, block)
+        self._set_clipboard(block)
+        self.registry.set_state(handle, RunState.COMPLETED.value)
+        self._close(ctx, handle)
+        return RunOutcome(run_id, RunState.COMPLETED,
+                          "duplicate action-id — nothing applied",
+                          result_block=block)
 
     # ------------------------------------------------------------------
     # Main entry
@@ -250,6 +390,14 @@ class LifecycleRunner:
         if payload.action in ACTION_OPS:
             return self._action_op(ctx, handle, payload, effective_cwd)
 
+        # --- Durable-goal headers on ordinary payloads: the binding
+        # must resolve, a replayed action-id stops here (before the
+        # gate, before anything executes), and a stale revision
+        # guard denies the run outright.
+        preflight = self._goal_preflight(ctx, handle, payload)
+        if preflight is not None:
+            return preflight
+
         # --- PreRun: built-in policy, then hooks (see _prerun).
         verdict = self._prerun(ctx, payload)
         if verdict.hard_block:
@@ -272,7 +420,7 @@ class LifecycleRunner:
             result = self._mutation_branch(ctx, handle, payload,
                                            effective_cwd, timeout)
             if isinstance(result, RunOutcome):
-                return result
+                return self._finish_outcome(payload, result)
             files_section = result
         if verdict.decision == Decision.ASK and command.strip():
             # A shell command the gate held (a mutation under
@@ -281,14 +429,29 @@ class LifecycleRunner:
             # reviewable: the command review branch stages it as a
             # command candidate and a decision executes it
             # (sandboxed by default) or parks it for one.
-            return self._shell_review_branch(
+            return self._finish_outcome(payload, self._shell_review_branch(
                 ctx, handle, payload, verdict, command, effective_cwd,
-                timeout, files_section)
+                timeout, files_section))
 
         if not command.strip():
-            return self._complete_files_only(ctx, handle, files_section)
-        return self._execute(ctx, handle, command, effective_cwd, timeout,
-                             files_section)
+            return self._finish_outcome(
+                payload, self._complete_files_only(ctx, handle,
+                                                   files_section))
+        return self._finish_outcome(
+            payload, self._execute(ctx, handle, command, effective_cwd,
+                                   timeout, files_section))
+
+    def _finish_outcome(self, payload: Payload,
+                        outcome: RunOutcome) -> RunOutcome:
+        """Record a completed payload's action id (idempotency): only
+        a COMPLETED run applied anything, so only it earns the
+        record — parked, denied, rejected and failed runs leave the
+        id free for a corrected re-send."""
+        if outcome.state == RunState.COMPLETED and payload.action_id:
+            self._record_action_id(
+                payload,
+                f"run {outcome.run_id}: {outcome.message}")
+        return outcome
 
     # ------------------------------------------------------------------
     # PreRun
@@ -750,16 +913,27 @@ class LifecycleRunner:
     def _action_op(self, ctx: RunContext, handle: RunHandle,
                    payload: Payload, cwd: str) -> RunOutcome:
         run_id = ctx.run_id
-        if not payload.session_id:
+        action = payload.action
+        read_only = action in READONLY_GOAL_OPS
+        if not payload.session_id and not payload.goal_uid \
+                and not read_only:
             return self._deny(
                 ctx, handle,
-                f"action {payload.action!r} needs a session: header — "
-                f"goal/task state is anchored to a session",
+                f"action {action!r} needs a session: header (or a "
+                f"goal: header naming the durable goal) — goal/task "
+                f"state is anchored to a durable goal, referenced "
+                f"by the session binding",
                 Event.PRE_RUN)
-        pre_tool_input: dict = {"action": payload.action,
+        pre_tool_input: dict = {"action": action,
                                 "body": payload.command}
-        if payload.action == "task-update":
+        if action == "task-update":
             pre_tool_input["transitions"] = payload.transitions
+        if payload.goal_uid:
+            pre_tool_input["goal_uid"] = payload.goal_uid
+        if payload.expect_revision is not None:
+            pre_tool_input["expect_revision"] = payload.expect_revision
+        if payload.action_id:
+            pre_tool_input["action_id"] = payload.action_id
         outcome = self._dispatch(Event.PRE_RUN, ctx, tool_name="Session",
                                  tool_input=pre_tool_input,
                                  tool_use_id=run_id)
@@ -768,74 +942,169 @@ class LifecycleRunner:
                               f"action gate: "
                               f"{outcome.hard_block_reason or outcome.error}",
                               Event.PRE_RUN)
-        store = GoalStore(self.state_dir, payload.session_id)
+
+        ledger = self.goal_ledger
+        store = (GoalStore(self.state_dir, payload.session_id)
+                 if payload.session_id else None)
         body = payload.command.strip()
         lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+        guards = {"expect_revision": payload.expect_revision,
+                  "action_id": payload.action_id,
+                  "action_scopes": self._goal_scopes(payload)}
         output_lines: list[str] = []
         applied: list[dict] = []
         batch_errors: list[dict] = []
-        if payload.action == "goal-set":
-            goal = store.set_goal(" ".join(lines))
-            output_lines.append(f"goal set: {goal['title']}")
-        elif payload.action == "goal-status":
-            status = lines[0].lower() if lines else ""
-            goal = store.set_goal_status(status) \
-                if status in ("active", "paused", "done") else None
-            output_lines.append(
-                f"goal status: {goal['status']}" if goal
-                else "no goal set, or unknown status")
-        elif payload.action == "task-add":
-            for line in lines:
-                store.add_task(line)
-                output_lines.append(f"task added: {line}")
-        else:  # task-update — the ONLY way to change a task's status
-            applied, batch_errors = store.apply_task_transitions(
-                payload.transitions)
-            if batch_errors:
+        rejected: str | None = None  # stale / duplicate / unknown goal
+        record_after: dict | None = None
+
+        def target_record() -> dict | None:
+            if payload.goal_uid:
+                return ledger.get(payload.goal_uid)
+            return store.record() if store else None
+
+        try:
+            if action == "goal-list":
                 output_lines.append(
-                    "task-update rejected — nothing applied:")
-                for error in batch_errors:
-                    output_lines.append(
-                        f"  {error['problem']} task: {error['title']}")
-            else:
-                for entry in applied:
-                    if entry["noop"]:
-                        output_lines.append(
-                            f"task {entry['to']}: {entry['title']} "
-                            f"(already {entry['to']} — no change)")
+                    render_goal_list(ledger.list_goals()))
+            elif action == "goal-show":
+                record = target_record()
+                output_lines.append(render_goal_show(
+                    record, payload.goal_uid or ""))
+                record_after = record
+            elif payload.goal_uid and target_record() is None:
+                rejected = (f"no such goal: {payload.goal_uid} — "
+                            f"discover goals with 'action: goal-list', "
+                            f"or import the goal first")
+            elif action == "goal-set":
+                text = " ".join(lines)
+                if payload.goal_uid:
+                    record_after = ledger.set_goal_text(
+                        payload.goal_uid, text, **guards,
+                        outcome=f"goal set: {text}")
+                    created = False
+                else:
+                    goal = store.set_goal(text, **guards)
+                    record_after = ledger.get(goal["uid"])
+                    created = goal["created"]
+                output_lines.append(f"goal set: {text}")
+                output_lines.append(
+                    f"goal_uid: {record_after['goal_uid']} · "
+                    f"revision {record_after['revision']}"
+                    + (" · created" if created else ""))
+            elif action == "goal-status":
+                status = lines[0].lower() if lines else ""
+                goal = None
+                if status in ("waiting", "active", "paused",
+                              "complete"):
+                    if payload.goal_uid:
+                        record_after = ledger.set_status(
+                            payload.goal_uid, status, **guards,
+                            outcome=f"goal status: {status}")
+                        goal = {"status": status}
                     else:
+                        goal = store.set_goal_status(status, **guards)
+                        record_after = store.record()
+                output_lines.append(
+                    f"goal status: {goal['status']}" if goal
+                    else "no goal set, or unknown status (expected "
+                         "waiting, active, paused or complete)")
+            elif action == "task-add":
+                if lines:
+                    if payload.goal_uid:
+                        added, record_after = ledger.add_tasks(
+                            payload.goal_uid, lines, **guards,
+                            outcome=f"tasks added: {len(lines)}")
+                    else:
+                        added, record_after = store.add_tasks(
+                            lines, **guards)
+                    for line in lines:
+                        output_lines.append(f"task added: {line}")
+                else:
+                    record_after = target_record()
+            else:  # task-update — the ONLY way to change a task's status
+                if payload.goal_uid:
+                    applied, batch_errors, record_after = \
+                        ledger.apply_task_transitions(
+                            payload.goal_uid, payload.transitions,
+                            **guards,
+                            outcome="task-update applied")
+                else:
+                    applied, batch_errors = \
+                        store.apply_task_transitions(
+                            payload.transitions, **guards)
+                    record_after = store.record()
+                if batch_errors:
+                    output_lines.append(
+                        "task-update rejected — nothing applied:")
+                    for error in batch_errors:
                         output_lines.append(
-                            f"task {entry['to']}: {entry['title']} "
-                            f"({entry['from']} → {entry['to']})")
+                            f"  {error['problem']} task: {error['title']}")
+                else:
+                    for entry in applied:
+                        if entry["noop"]:
+                            output_lines.append(
+                                f"task {entry['to']}: {entry['title']} "
+                                f"(already {entry['to']} — no change)")
+                        else:
+                            output_lines.append(
+                                f"task {entry['to']}: {entry['title']} "
+                                f"({entry['from']} → {entry['to']})")
+        except DuplicateAction as dup:
+            rejected = (f"duplicate action-id {dup.action_id} — "
+                        f"already applied ({dup.outcome}); nothing "
+                        f"was executed or changed")
+        except StaleRevision as stale:
+            rejected = (f"{action} rejected — stale revision: "
+                        f"expected {stale.expected}, current "
+                        f"revision is {stale.actual}; nothing applied")
+        except GoalStoreError as exc:
+            rejected = f"{action} rejected — {exc}"
+        if rejected is not None:
+            output_lines = [rejected]
+            record_after = target_record()
+
         output = "\n".join(output_lines) or "(no change)"
-        if payload.action == "task-update":
+        if action == "task-update":
             summary = "; ".join(
                 f"{t['status']}: {t['title']}"
                 for t in payload.transitions)
             ctx.command_executed = f"(task-update) {summary}".strip()
+        elif read_only:
+            ctx.command_executed = f"({action})"
         else:
-            ctx.command_executed = f"({payload.action}) {body}".strip()
+            ctx.command_executed = f"({action}) {body}".strip()
         tool_response = {"exit_desc": "0", "output": output}
-        if payload.action == "task-update":
+        if action == "task-update":
             # One receipt for the batch, carrying the full transition
             # list (and, on an atomic reject, every error).
             tool_response["transitions"] = applied
             if batch_errors:
                 tool_response["errors"] = batch_errors
+        if record_after is not None:
+            tool_response["goal_uid"] = record_after["goal_uid"]
+            tool_response["revision"] = record_after["revision"]
+        if rejected is not None:
+            tool_response["rejected"] = rejected
         outcome = self._dispatch(Event.POST_RUN, ctx, tool_name="Session",
-                                 tool_input={"action": payload.action},
+                                 tool_input={"action": action},
                                  tool_use_id=run_id,
                                  extra={"tool_response": tool_response,
                                         "error": None, "duration_ms": 0})
         self.ledger.append(run_id, Event.POST_RUN.value,
                            {"status": "ok", "tool_name": "Session",
-                            "tool_input": {"action": payload.action},
+                            "tool_input": {"action": action},
                             "tool_response": tool_response,
                             "duration_ms": 0},
                            session_id=self.session_id,
                            binding_id=payload.session_id)
+        if record_after is not None:
+            section = render_section(record_after)
+        elif payload.session_id or payload.goal_uid:
+            section = render_section(target_record())
+        else:
+            section = ""
         block = format_result(ctx.command_executed, output, "0", 0.0, "",
-                              standing_section=store.section(),
+                              standing_section=section,
                               extra_section=self._extra_section(
                                   ctx, outcome),
                               budget=self.settings.result_budget_chars)
@@ -843,10 +1112,12 @@ class LifecycleRunner:
         self._set_clipboard(block)
         self.registry.set_state(handle, RunState.COMPLETED.value)
         self._close(ctx, handle)
-        if payload.action == "task-update" and batch_errors:
+        if action == "task-update" and batch_errors:
             message = "task-update rejected — nothing applied"
+        elif rejected is not None:
+            message = rejected
         else:
-            message = f"{payload.action} applied"
+            message = f"{action} applied"
         return RunOutcome(run_id, RunState.COMPLETED, message,
                           result_block=block)
 
@@ -1160,10 +1431,15 @@ class LifecycleRunner:
     # ------------------------------------------------------------------
 
     def _standing(self, ctx: RunContext) -> str:
-        """The core goal/task nag — bound runs only, hooks or no hooks."""
-        if not ctx.binding_id:
+        """The core goal/task nag — bound runs only, hooks or no hooks.
+
+        Projected from the DURABLE record: the payload's `goal:`
+        header wins, else the session's bound goal. Session state
+        never overrides the durable projection — the record is the
+        truth; the session is only a reference to it."""
+        if not ctx.binding_id and not ctx.payload.goal_uid:
             return ""
-        return GoalStore(self.state_dir, ctx.binding_id).section()
+        return render_section(self._goal_record_for(ctx.payload))
 
     def _manifest_section(self, ctx: RunContext) -> str:
         """Refreshed capability manifest — bound runs, once per change."""

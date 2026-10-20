@@ -28,6 +28,13 @@ import time
 from pathlib import Path
 
 SHIM = Path(__file__).resolve().parent / "_cli_shim.py"
+
+# Deadline for waits gated on a background CLI process starting up.
+# Sized for shared CI runners, where two concurrent cold Python
+# startups plus state-dir/SQLite init can exceed the 12s in-process
+# default by a wide margin; the cases assert behavior, not startup
+# latency.
+STARTUP_TIMEOUT = 60
 PY = sys.executable
 
 
@@ -163,6 +170,13 @@ class Env:
         return json.loads(path.read_text(encoding="utf-8"))["state"]
 
     def wait_for(self, pred, timeout: float = 12, what: str = "condition"):
+        # NOTE: waits gated on a background CLI process starting up
+        # (session state reaching "running", a candidate staging) must
+        # pass timeout=STARTUP_TIMEOUT — cold-starting Python processes
+        # on a shared CI runner can take far longer than the 12s
+        # default, which is sized for in-process conditions. (CI-only
+        # failure, 0.2.0 release gate: case 33 timed out at 12s with
+        # both runs merely slow to start.)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if pred():
@@ -287,7 +301,7 @@ def case_07(env: Env):
                    "```shell\nsession: long-7\ntimeout: 60\nsleep 30\n```")
     proc, out_path = env.bg("run", "--file", "payload.txt")
     env.wait_for(lambda: env.session_state("long-7") == "running",
-                 what="long run to start")
+                 timeout=STARTUP_TIMEOUT, what="long run to start")
     env.clip.write_text("```cancel id=long-7```", encoding="utf-8")
     cancel = env.trigger()
     check(cancel.returncode == 0, cancel.stderr)
@@ -880,7 +894,7 @@ def case_33(env: Env):
     proc_b, out_b = env.bg("run", "--file", "payload-s33-b.txt")
     env.wait_for(lambda: env.session_state("s33-a") == "running"
                  and env.session_state("s33-b") == "running",
-                 what="both runs to start")
+                 timeout=STARTUP_TIMEOUT, what="both runs to start")
     env.clip.write_text("```cancel id=s33-a```", encoding="utf-8")
     env.trigger()
     out = env.bg_finish(proc_a, out_a)
@@ -1114,6 +1128,7 @@ def case_44(env: Env):
     env.wait_for(lambda: cands.exists()
                  and any((d / "manifest.json").exists()
                          for d in cands.iterdir()),
+                 timeout=STARTUP_TIMEOUT,
                  what="attended candidate to stage")
     time.sleep(1.5)
     check(proc.poll() is None,
@@ -1315,6 +1330,7 @@ def case_50(env: Env):
     env.wait_for(lambda: cands.exists()
                  and any((d / "manifest.json").exists()
                          for d in cands.iterdir()),
+                 timeout=STARTUP_TIMEOUT,
                  what="trigger candidate to stage")
     time.sleep(1.0)
     check(proc.poll() is None,
@@ -1544,6 +1560,7 @@ def case_57(env: Env):
     env.wait_for(lambda: cands.exists()
                  and any((d / "manifest.json").exists()
                          for d in cands.iterdir()),
+                 timeout=STARTUP_TIMEOUT,
                  what="command candidate to stage")
     cid = next(d.name for d in cands.iterdir()
                if (d / "manifest.json").exists())

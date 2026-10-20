@@ -267,10 +267,17 @@ def test_upgrade_unreachable_feed_aborts():
 # ----------------------------------------------------------------------
 
 def test_pyproject_registers_both_scripts():
-    import tomllib
+    # tomllib is 3.11+; the suite also runs on 3.10, so fall back to
+    # a targeted scan of the [project.scripts] section there.
     root = Path(__file__).resolve().parents[1]
-    with (root / "pyproject.toml").open("rb") as fh:
-        project = tomllib.load(fh)["project"]
-    scripts = project["scripts"]
+    text = (root / "pyproject.toml").read_text(encoding="utf-8")
+    try:
+        import tomllib
+    except ImportError:
+        import re
+        section = text.split("[project.scripts]", 1)[1].split("[", 1)[0]
+        scripts = dict(re.findall(r'(\S+)\s*=\s*"([^"]+)"', section))
+    else:
+        scripts = tomllib.loads(text)["project"]["scripts"]
     assert scripts["clip-harness"] == "clip_harness.cli:main"
     assert scripts["clip"] == "clip_harness.cli:main"

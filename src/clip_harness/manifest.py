@@ -74,10 +74,11 @@ BUILTIN_TOOLS: list[dict] = [
     },
     {
         "name": "task.update",
-        "description": "Move a task's status (open/doing/done).",
-        "shape": "```shell fence with header `action: task-doing` / "
-                 "`task-done` / `task-open` and `session: <id>`; "
-                 "body = the task title",
+        "description": "Change task statuses in ONE atomic batch: "
+                       "every transition applies, or none does.",
+        "shape": "```shell fence with header `action: task-update` "
+                 "and `session: <id>`; one `<status>: <exact task "
+                 "title>` line per transition, status done/doing/open",
     },
 ]
 

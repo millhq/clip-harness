@@ -144,6 +144,11 @@ class Payload:
     # in the header, as written; resolved against the effective cwd at
     # review time). The declaration scopes the Seatbelt sandbox a
     # reviewed command runs under; it never widens anything by itself.
+    transitions: list[dict] = field(default_factory=list)  # task-update
+    # batch: [{"status": "done"|"doing"|"open", "title": <exact title>}]
+    # parsed from an `action: task-update` payload's transition lines.
+    # The batch applies atomically (all or nothing) in the goal store;
+    # a task-update payload has no shell command.
 
     @property
     def bound(self) -> bool:

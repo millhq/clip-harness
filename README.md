@@ -150,8 +150,15 @@ text. Recognised keys:
   **No `session:` → the run is unbound but still runs.** A missing id
   never blocks execution.
 - `action:` — `run` (default); the core goal/task operations
-  `goal-set`, `goal-status`, `task-add`, `task-doing`, `task-done`,
-  `task-open` (these require a session).
+  `goal-set`, `goal-status`, `task-add`, `task-update` (these
+  require a session). `task-update` is the only status-change form:
+  its body is one `<status>: <exact task title>` line per transition
+  (status `done` / `doing` / `open`), and the batch applies
+  atomically — every title is validated first, and an unknown,
+  duplicated or conflicting title rejects the whole batch with
+  nothing applied. (Migration: the single-task `task-doing` /
+  `task-done` / `task-open` actions were removed; a payload naming
+  one gets a static migration error pointing at `task-update`.)
 - `cwd:` — working directory override.
 - `timeout:` — per-command timeout in seconds.
 - `attend:` — `true` opts this run into attended mode (below);
@@ -362,7 +369,10 @@ clip-harness goal --session auth-refactor task-update "wire tokens" doing
 clip-harness goal --session auth-refactor show
 ```
 
-…or from the chat side, via `action:` payloads (see the manifest).
+…or from the chat side, via `action:` payloads (see the manifest):
+tasks are created with `task-add`, and their statuses change only
+through `task-update` — one atomic batch of
+`<status>: <exact task title>` lines per payload.
 State is stored per session under the state dir and survives restarts.
 
 ## Capability manifest

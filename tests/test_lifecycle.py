@@ -737,7 +737,8 @@ def test_task_action_ops_round_trip(make_runner):
         "```shell\nsession: t1\naction: task-add\n"
         "first task\nsecond task\n```", "/tmp")
     op = runner.process_text(
-        "```shell\nsession: t1\naction: task-done\nfirst task\n```",
+        "```shell\nsession: t1\naction: task-update\n"
+        "done: first task\n```",
         "/tmp")
     assert "task done: first task" in op.result_block
     assert "[open] second task" in op.result_block

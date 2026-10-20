@@ -85,6 +85,63 @@ class GoalStore:
                 return task
         return None
 
+    def apply_task_transitions(
+            self, transitions: list[dict]) -> tuple[list[dict], list[dict]]:
+        """Validate a batch of status transitions, then apply — or not.
+
+        Anthropic's converged shape: judge the SET, not each op. Every
+        title is resolved against the current task list first; if any
+        title is unknown, duplicated (same title, same status twice)
+        or conflicting (same title, different statuses), NOTHING is
+        applied — the store is not even written — and the errors list
+        names each offending title with its problem. Re-setting a
+        task to the status it already has is a valid no-op
+        transition, reported as such, so idempotent re-sends never
+        fail.
+
+        Returns (applied, errors): applied entries are
+        {"title", "from", "to", "noop"} in batch order.
+        """
+        for transition in transitions:
+            if transition["status"] not in TASK_STATUSES:
+                raise ValueError(
+                    f"task status must be one of {TASK_STATUSES}")
+        by_title: dict[str, dict] = {}
+        for task in self._data["tasks"]:
+            by_title.setdefault(task["title"], task)
+        counts: dict[str, int] = {}
+        for transition in transitions:
+            title = transition["title"]
+            counts[title] = counts.get(title, 0) + 1
+        errors: list[dict] = []
+        flagged: set[str] = set()
+        for transition in transitions:
+            title = transition["title"]
+            if title in flagged:
+                continue
+            if counts[title] > 1:
+                statuses = {t["status"] for t in transitions
+                            if t["title"] == title}
+                problem = "conflicting" if len(statuses) > 1 \
+                    else "duplicate"
+                errors.append({"title": title, "problem": problem})
+                flagged.add(title)
+            elif title not in by_title:
+                errors.append({"title": title, "problem": "unknown"})
+                flagged.add(title)
+        if errors:
+            return [], errors
+        applied: list[dict] = []
+        for transition in transitions:
+            task = by_title[transition["title"]]
+            old = task["status"]
+            task["status"] = transition["status"]
+            applied.append({"title": transition["title"], "from": old,
+                            "to": transition["status"],
+                            "noop": old == transition["status"]})
+        self._save()
+        return applied, []
+
     def tasks(self) -> list[dict]:
         return list(self._data["tasks"])
 

@@ -44,9 +44,9 @@ These are the tools you may invoke, and the block shape for each:
 - **task.add** — add open tasks to the session.
   Shape: a ```shell fence with header `action: task-add`, one task
   per body line.
-- **task.update** — move a task's status.
-  Shape: a ```shell fence with header `action: task-doing` /
-  `task-done` / `task-open`; body = the exact task title.
+- **task.update** — change task statuses, in one atomic batch.
+  Shape: a ```shell fence with header `action: task-update`, then
+  one `<status>: <exact task title>` line per transition.
 
 Hooks may register additional tools mid-session. When they do, the
 new manifest is included in a result block under `— capabilities:` —
@@ -193,15 +193,24 @@ Update the session tests
 ```
 
 ```shell
-session: auth-refactor
-action: task-done
-Wire the token endpoint
+session: velocity-navigator
+action: task-update
+done: Implement generic OpenAPI discovery with complete candidate accounting
+doing: Normalize canonical contracts and HTTP operations into generic units
 ```
 ````
 
-Set the goal once when work starts; add tasks as you plan them; mark
-them `task-doing` / `task-done` as they progress. These operations
-require a `session:` header — they are anchored to the session.
+Set the goal once when work starts; add tasks as you plan them with
+`task-add`. Change a task's status ONLY with `task-update` — the one
+canonical form for status changes: a single payload carrying every
+transition, one `done:` / `doing:` / `open:` line per task, titles
+exact. The batch is **atomic**: every title is checked against the
+session's tasks first, and if any title is unknown, duplicated or
+conflicting, **nothing is applied** and the result block names each
+problem — fix the batch and re-send it whole. Re-setting a task to
+the status it already has is a valid no-op, so re-sending a batch is
+safe. These operations require a `session:` header — they are
+anchored to the session.
 
 ## Reading result blocks
 

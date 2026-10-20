@@ -22,6 +22,15 @@ A copied message is ONE payload made of fences:
         — it scopes the sandbox when the command is held for review;
         an empty value is malformed (fail closed).
 
+        Goal/task action payloads (`action: goal-set` / `goal-status` /
+        `task-add` / `task-update`) carry no shell text: the body is
+        action data. A `task-update` body is one
+        `<status>: <exact task title>` transition per line (status
+        done / doing / open, repeatable), parsed here into
+        `payload.transitions` — the batch the goal store validates
+        and applies atomically, or not at all. Malformed transition
+        lines fail closed, like malformed header metadata.
+
     ```file
     path: src/auth.py
     op: update
@@ -92,6 +101,52 @@ _OP_LINE_UNFENCED = re.compile(
     r"^op\s*:\s*(create|update|delete)\s*$", re.IGNORECASE)
 _ATTR_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)=(.*)$")
 _ID_KEYS = {"id", "session"}
+_TRANSITION_LINE = re.compile(
+    r"^(done|doing|open)\s*:\s*(.+?)\s*$", re.IGNORECASE)
+_TRANSITION_KEY = re.compile(r"^([A-Za-z][A-Za-z-]*)\s*:\s*(.*?)\s*$")
+_TASK_STATUSES = ("done", "doing", "open")
+
+
+def _parse_task_transitions(body: str) -> list[dict]:
+    """Parse the body of an `action: task-update` payload.
+
+    One transition per line: `<status>: <exact task title>` with
+    status done / doing / open, repeatable (multiple titles per
+    status via multiple lines). The batch is atomic — set-level
+    validation (unknown / duplicate / conflicting titles) happens
+    in the goal store; here, any line that is not a well-formed
+    transition fails closed, exactly like malformed header metadata:
+    an unknown status key, a missing title, or a line with no
+    status at all is a PayloadError, never shell text.
+    """
+    transitions: list[dict] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = _TRANSITION_LINE.match(line)
+        if match:
+            transitions.append({"status": match.group(1).lower(),
+                                "title": match.group(2)})
+            continue
+        keyed = _TRANSITION_KEY.match(line)
+        if keyed and keyed.group(1).lower() in _TASK_STATUSES:
+            raise PayloadError(
+                f"task-update line {line!r} is missing a task title "
+                f"— expected '<status>: <exact task title>'")
+        if keyed:
+            raise PayloadError(
+                f"task-update line {line!r} has an unknown status "
+                f"{keyed.group(1)!r} — expected done, doing or open")
+        raise PayloadError(
+            f"malformed task-update line {line!r} — expected "
+            f"'<status>: <exact task title>' with status done, doing "
+            f"or open")
+    if not transitions:
+        raise PayloadError(
+            "task-update payload has no transitions — one "
+            "'<status>: <exact task title>' line per change")
+    return transitions
 
 
 class PayloadError(ValueError):
@@ -185,6 +240,14 @@ def _parse_shell_body(body: str, fence_attrs: dict[str, str]) -> Payload:
                 "paths the command may write, comma-separated, or "
                 "omit the header")
         payload.writes = entries
+    if payload.action == "task-update":
+        # The body of a task-update payload is not shell text: it is
+        # the transition batch (see _parse_task_transitions). Parse
+        # and consume it here, in the same place the header grammar
+        # lives, so a transition line can never reach the shell —
+        # the same guarantee the metadata header has.
+        payload.transitions = _parse_task_transitions(command)
+        payload.command = ""
     return payload
 
 
@@ -242,7 +305,7 @@ def _parse_unfenced(text: str) -> Payload | None:
     # fenced body parser cannot tell this text was never fenced.
     payload = _parse_shell_body(text, {})
     payload.raw = text
-    if not payload.command.strip():
+    if not payload.command.strip() and not payload.transitions:
         raise PayloadError(
             "unfenced payload has a metadata header but no command")
     return payload
@@ -384,7 +447,8 @@ def parse_payload(text: str) -> Payload | None:
         payload = Payload(command="", kind="run")  # pure mutation payload
     payload.files = files
     payload.raw = text
-    if not payload.command.strip() and not files and payload.kind == "run":
+    if not payload.command.strip() and not files \
+            and not payload.transitions and payload.kind == "run":
         raise PayloadError("run payload has an empty command")
     return payload
 

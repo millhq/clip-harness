@@ -833,7 +833,7 @@ def case_31(env: Env):
     env.run_payload("```shell\nsession: s31\necho run-3\n```")
     _, tasks_line = _check_footer(env.clip_text(), "run 3")
     check(tasks_line == "[open tasks] [open] beta task",
-          f"footer did not update after task-done: {tasks_line!r}")
+          f"footer did not update after CLI task-update: {tasks_line!r}")
 
 
 def case_32(env: Env):
@@ -851,13 +851,13 @@ def case_32(env: Env):
     check("[open] first job" in tasks_line
           and "[open] second job" in tasks_line,
           f"task-add not reflected: {tasks_line!r}")
-    env.run_payload("```shell\nsession: s32\naction: task-done\n"
-                    "first job\n```")
+    env.run_payload("```shell\nsession: s32\naction: task-update\n"
+                    "done: first job\n```")
     env.run_payload("```shell\nsession: s32\necho final\n```")
-    _, tasks_line = _check_footer(env.clip_text(), "after task-done")
+    _, tasks_line = _check_footer(env.clip_text(), "after task-update")
     check("first job" not in tasks_line
           and "second job" in tasks_line,
-          f"task-done not reflected: {tasks_line!r}")
+          f"task-update not reflected: {tasks_line!r}")
 
 
 def case_33(env: Env):
@@ -1597,6 +1597,57 @@ def case_58(env: Env):
     check("(reviewed · sandboxed)" in env.clip_text(),
           f"completion block lacks the reviewed note: "
           f"{env.clip_text()!r}")
+
+
+def case_59(env: Env):
+    # Atomic batch task transitions: one task-update payload moves
+    # three tasks at once (done + doing + open), and the single
+    # result block's footer reflects the final state.
+    env.run_payload("```shell\nsession: s59\naction: task-add\n"
+                    "alpha task\nbeta task\ngamma task\n```")
+    env.run_payload("```shell\nsession: s59\naction: task-update\n"
+                    "doing: alpha task\ndone: gamma task\n```")
+    proc = env.run_payload(
+        "```shell\nsession: s59\naction: task-update\n"
+        "done: alpha task\ndoing: beta task\nopen: gamma task\n```")
+    check(proc.returncode == 0, proc.stderr)
+    block = env.clip_text()
+    check("task done: alpha task (doing → done)" in block,
+          f"done transition missing from block: {block!r}")
+    check("task doing: beta task (open → doing)" in block,
+          f"doing transition missing from block: {block!r}")
+    check("task open: gamma task (done → open)" in block,
+          f"open transition missing from block: {block!r}")
+    _, tasks_line = _check_footer(block, "after batch")
+    check(tasks_line == "[open tasks] [doing] beta task · "
+          "[open] gamma task",
+          f"footer does not reflect the whole batch: {tasks_line!r}")
+
+
+def case_60(env: Env):
+    # Atomicity through the entry point: one unknown title among
+    # valid transitions rejects the WHOLE batch (nothing applies),
+    # and a removed single-task action gets the migration error.
+    env.run_payload("```shell\nsession: s60\naction: task-add\n"
+                    "alpha task\nbeta task\n```")
+    env.run_payload("```shell\nsession: s60\naction: task-update\n"
+                    "done: alpha task\ndoing: ghost task\n```")
+    block = env.clip_text()
+    check("task-update rejected — nothing applied" in block,
+          f"batch was not rejected as a unit: {block!r}")
+    check("unknown task: ghost task" in block,
+          f"rejection does not name the unknown title: {block!r}")
+    env.run_payload("```shell\nsession: s60\necho after\n```")
+    _, tasks_line = _check_footer(env.clip_text(), "after reject")
+    check("[open] alpha task" in tasks_line,
+          f"valid transition leaked through the reject: "
+          f"{tasks_line!r}")
+    env.run_payload("```shell\nsession: s60\naction: task-done\n"
+                    "alpha task\n```")
+    note = env.clip_text()
+    check("action 'task-done' was removed" in note
+          and "'task-update'" in note,
+          f"removed action lacks the migration error: {note!r}")
 
 
 # =======================================================================

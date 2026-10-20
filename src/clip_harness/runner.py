@@ -55,8 +55,13 @@ from .receipts import Ledger, Transcript
 from .sessions import RunHandle, SessionRegistry
 from .settings import Settings, add_project_allowlist_pattern, load_settings
 
-ACTION_OPS = {"goal-set", "goal-status", "task-add",
-              "task-doing", "task-done", "task-open"}
+ACTION_OPS = {"goal-set", "goal-status", "task-add", "task-update"}
+
+# Single-task status actions, removed outright (no backward compat —
+# migrate once to the latest): `task-update` replaces them. A payload
+# naming one gets a static migration error, never a shell run of its
+# body.
+REMOVED_TASK_ACTIONS = {"task-doing", "task-done", "task-open"}
 
 
 @dataclass
@@ -233,6 +238,15 @@ class LifecycleRunner:
         timeout = payload.timeout or self.settings.timeout
 
         # --- Goal/task operations are core actions, handled in-process.
+        if payload.action in REMOVED_TASK_ACTIONS:
+            return self._deny(
+                ctx, handle,
+                f"action {payload.action!r} was removed — task status "
+                f"changes now go through one atomic 'task-update' "
+                f"payload: header `action: task-update`, then one "
+                f"'<status>: <exact task title>' line per transition "
+                f"(done: / doing: / open:)",
+                Event.PRE_RUN)
         if payload.action in ACTION_OPS:
             return self._action_op(ctx, handle, payload, effective_cwd)
 
@@ -733,9 +747,12 @@ class LifecycleRunner:
                 f"action {payload.action!r} needs a session: header — "
                 f"goal/task state is anchored to a session",
                 Event.PRE_RUN)
+        pre_tool_input: dict = {"action": payload.action,
+                                "body": payload.command}
+        if payload.action == "task-update":
+            pre_tool_input["transitions"] = payload.transitions
         outcome = self._dispatch(Event.PRE_RUN, ctx, tool_name="Session",
-                                 tool_input={"action": payload.action,
-                                             "body": payload.command},
+                                 tool_input=pre_tool_input,
                                  tool_use_id=run_id)
         if outcome is not None and outcome.gate_failed(Event.PRE_RUN):
             return self._deny(ctx, handle,
@@ -746,6 +763,8 @@ class LifecycleRunner:
         body = payload.command.strip()
         lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
         output_lines: list[str] = []
+        applied: list[dict] = []
+        batch_errors: list[dict] = []
         if payload.action == "goal-set":
             goal = store.set_goal(" ".join(lines))
             output_lines.append(f"goal set: {goal['title']}")
@@ -760,15 +779,40 @@ class LifecycleRunner:
             for line in lines:
                 store.add_task(line)
                 output_lines.append(f"task added: {line}")
-        else:  # task-doing / task-done / task-open
-            status = payload.action.removeprefix("task-")
-            task = store.set_task_status(body, status)
-            output_lines.append(
-                f"task {status}: {body}" if task
-                else f"task not found: {body}")
+        else:  # task-update — the ONLY way to change a task's status
+            applied, batch_errors = store.apply_task_transitions(
+                payload.transitions)
+            if batch_errors:
+                output_lines.append(
+                    "task-update rejected — nothing applied:")
+                for error in batch_errors:
+                    output_lines.append(
+                        f"  {error['problem']} task: {error['title']}")
+            else:
+                for entry in applied:
+                    if entry["noop"]:
+                        output_lines.append(
+                            f"task {entry['to']}: {entry['title']} "
+                            f"(already {entry['to']} — no change)")
+                    else:
+                        output_lines.append(
+                            f"task {entry['to']}: {entry['title']} "
+                            f"({entry['from']} → {entry['to']})")
         output = "\n".join(output_lines) or "(no change)"
-        ctx.command_executed = f"({payload.action}) {body}".strip()
+        if payload.action == "task-update":
+            summary = "; ".join(
+                f"{t['status']}: {t['title']}"
+                for t in payload.transitions)
+            ctx.command_executed = f"(task-update) {summary}".strip()
+        else:
+            ctx.command_executed = f"({payload.action}) {body}".strip()
         tool_response = {"exit_desc": "0", "output": output}
+        if payload.action == "task-update":
+            # One receipt for the batch, carrying the full transition
+            # list (and, on an atomic reject, every error).
+            tool_response["transitions"] = applied
+            if batch_errors:
+                tool_response["errors"] = batch_errors
         outcome = self._dispatch(Event.POST_RUN, ctx, tool_name="Session",
                                  tool_input={"action": payload.action},
                                  tool_use_id=run_id,
@@ -790,8 +834,11 @@ class LifecycleRunner:
         self._set_clipboard(block)
         self.registry.set_state(handle, RunState.COMPLETED.value)
         self._close(ctx, handle)
-        return RunOutcome(run_id, RunState.COMPLETED,
-                          f"{payload.action} applied",
+        if payload.action == "task-update" and batch_errors:
+            message = "task-update rejected — nothing applied"
+        else:
+            message = f"{payload.action} applied"
+        return RunOutcome(run_id, RunState.COMPLETED, message,
                           result_block=block)
 
     # ------------------------------------------------------------------

@@ -55,11 +55,24 @@ These are the tools you may invoke, and the block shape for each:
   losing the chat or session.
   Shape: a ```shell fence with header `action: goal-list`, no body,
   no session needed.
-- **goal.show** — show one durable goal in full: goal text, plan +
-  steps with statuses, tasks, backlog, latest result, revision,
+- **goal.show** — show one durable goal: goal text, its tasks, a
+  pointer to its plan document, latest result, revision,
   provenance. Read-only.
   Shape: a ```shell fence with headers `action: goal-show` and
   `goal: <goal_uid>` (or the session's bound goal).
+- **plan.set** — set the goal's plan: a Markdown DOCUMENT you
+  author whole — its title line is its version identity (e.g.
+  `# PLAN v2`). The harness stores it verbatim and never parses
+  steps or statuses out of it; replacing is whole-document.
+  Counts as a goal mutation: the `expect-revision:` /
+  `action-id:` guards apply.
+  Shape: a ```shell fence with header `action: plan-set` plus
+  `session: <id>` (or `goal: <goal_uid>`); the body IS the
+  entire plan document.
+- **plan.show** — show the goal's plan document, verbatim.
+  Read-only.
+  Shape: a ```shell fence with header `action: plan-show` (no
+  body; the session's bound goal, or the `goal:` header's goal).
 - **task.add** — add open tasks to the bound durable goal.
   Shape: a ```shell fence with header `action: task-add`, one task
   per body line.
@@ -247,8 +260,9 @@ harness-issued `goal_uid` that never changes; a session only
 tasks back to you in **every** bound result block — and the goal
 survives the chat. Lose the session entirely and the recovery is:
 `action: goal-list` to rediscover the uid, then `action: goal-show`
-with `goal: <goal_uid>` to reconcile (plan, current step, tasks,
-backlog, revision) before doing anything else.
+with `goal: <goal_uid>` to reconcile (goal, tasks, the plan
+pointer, revision) before doing anything else — and
+`action: plan-show` when you need the plan document itself.
 
 Every goal carries a `revision` that increments on each mutation,
 and statuses `waiting` / `active` / `paused` / `complete` (set with
@@ -265,7 +279,7 @@ then finishing a task against the revision you just read:
 action: goal-show
 goal: 33476ec7-1cfd-4634-93d6-ab22dde10b23
 ```
-→ [goal] "…" · status: active · revision: 2 · plan: PLAN v2 · current step 5 …
+→ goal: "…" · status: active · revision: 2 · plan: # PLAN v2 (full document: 'action: plan-show') · tasks: …
 
 ```shell
 session: navigator-resume
@@ -365,8 +379,9 @@ files:
   saw in the terminal.
 - The block always ENDS with the sticky footer: a `[goal]` line —
   goal text, status, and the goal's short uid in parentheses —
-  then an `[open tasks]` line. When the goal has a plan, a
-  `[step] N — <title>` line sits between them. The footer is
+  then an `[open tasks]` line. There is no `[step]` line:
+  nothing stores a current step — the task in progress shows as
+  `[doing]` inside `[open tasks]`. The footer is
   projected from the durable goal record by the harness; treat it
   as current truth about what you're supposed to be doing. If it
   disagrees with your plan, fix the state with the goal/task

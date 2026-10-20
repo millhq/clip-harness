@@ -32,6 +32,12 @@ These are the tools you may invoke, and the block shape for each:
 - **file.write** — propose a full-file create/update/delete. Staged
   and applied only after the human reviews it.
   Shape: one ```file fence per file.
+- **file.edit** — propose an exact-text edit to ONE existing file
+  (Claude Code's Edit): replace `old_string` with `new_string`,
+  matched exactly. Staged and reviewed like file.write — the
+  harness generates the diff, so never hand-count patch hunks for
+  a change you can express as an edit.
+  Shape: one ```edit fence per file.
 - **patch.apply** — propose a change to one file as a unified diff.
   Staged and reviewed like file.write.
   Shape: one ```patch fence per file.
@@ -124,7 +130,7 @@ and therefore cannot be sent as ```file / ```patch fences. Prefer
 the fences when the change itself is declarable — they are
 reviewed as diffs; use a shell command + `writes:` when it is not.
 
-## Emitting file changes: ```file and ```patch fences
+## Emitting file changes: ```file, ```edit and ```patch fences
 
 One message may contain one ```shell fence **plus** one fence per
 file:
@@ -139,6 +145,14 @@ npm test
 path: src/auth.py
 op: update
 <the FULL new content of src/auth.py>
+```
+
+```edit
+path: src/config.py
+old_string:
+DEBUG = True
+new_string:
+DEBUG = False
 ```
 
 ```patch
@@ -160,8 +174,37 @@ Rules:
   disk (NEW / UPDATE / DELETE / NO-CHANGE) and flags mismatches
   between your declared op and reality.
 - For a delete, use a ```file fence with `op: delete` and no content.
-- Use ```patch when a small diff is clearer than a whole file; the
-  diff must apply cleanly to the current file.
+- **Prefer ```edit over ```patch for any change you author
+  yourself** — you supply exact text; the harness generates the
+  diff, so there are no hunk counts to get wrong. The ```edit
+  rules (Claude Code's Edit, exactly):
+  - `old_string` must match the file **exactly**, whitespace
+    included, and must be **unique** in the file — staging fails
+    when it occurs zero times (copy the exact current text and
+    re-send) or more than once. For a genuinely repeated change,
+    set the optional header `replace_all: true` (only `true` /
+    `false` are valid); otherwise include more surrounding
+    context to make the match unique.
+  - `new_string` must **differ** from `old_string`. An **empty**
+    `new_string:` section **deletes** the matched block. To
+    **insert**, include the anchor text in `new_string` plus the
+    new text — inserts and deletes live inside this one operation;
+    there are no other edit operations.
+  - Edits target **existing files only** — an edit never creates
+    a file; use a ```file fence to create one. No `op:` line: an
+    edit is always an update.
+  - **One edit per file per payload.** A second fence for the
+    same file (another edit, or any other fence) is rejected —
+    send the next edit in the next payload, after the result, or
+    send the whole change as one ```file / ```patch fence.
+  - If the text itself contains a literal line that is exactly
+    `old_string:` or `new_string:`, the section markers collide —
+    use a ```file fence for that change instead.
+- Use ```patch only for pre-generated, known-valid diffs (e.g.
+  produced by a tool); a hand-written diff must still apply
+  cleanly to the current file, hunk counts included — a count
+  mismatch fails staging with the declared vs actual counts
+  named, and the fix is usually to re-send it as an ```edit.
 - File changes are **never applied directly**. They are staged as a
   candidate; the human sees a manifest (path · op · line counts) and
   an inline diff per file, then accepts, accepts with edits, or

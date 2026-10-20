@@ -359,7 +359,16 @@ class LifecycleRunner:
         run_id = ctx.run_id
         for index, spec in enumerate(payload.files):
             target = Path(cwd) / spec.path
-            if spec.declared_op == "delete":
+            if spec.is_edit:
+                # Claude Code's Edit hook shape, exactly — it takes
+                # precedence over the content/patch reclassifications
+                # below, whose "Edit" carries a different input.
+                tool_name = "Edit"
+                tool_input = {"file_path": spec.path,
+                              "old_string": spec.old_string,
+                              "new_string": spec.new_string,
+                              "replace_all": spec.replace_all}
+            elif spec.declared_op == "delete":
                 tool_name, tool_input = "Delete", {"file_path": spec.path}
             elif target.is_file():
                 tool_name = "Edit"

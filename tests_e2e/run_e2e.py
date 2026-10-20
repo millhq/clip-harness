@@ -1650,6 +1650,37 @@ def case_60(env: Env):
           f"removed action lacks the migration error: {note!r}")
 
 
+def case_61(env: Env):
+    # file.edit end-to-end through the CLI: an ```edit fence parks
+    # as a candidate whose manifest classifies it as an UPDATE with
+    # the harness computing the staged bytes; accepting applies the
+    # exact-text replacement and the result block carries the
+    # harness-generated diff. The model never wrote a diff.
+    env.write_file("auth.py", "def greet():\n    return 'hello'\n")
+    cid = _stage(env,
+                 "```edit\npath: auth.py\n"
+                 "old_string:\n    return 'hello'\n"
+                 "new_string:\n    return 'hello, world'\n```")
+    entry = env.manifest(cid)["entries"][0]
+    check(entry["declared_op"] == "update"
+          and entry["actual_op"] == "UPDATE",
+          f"edit misclassified in manifest: {entry}")
+    check((env.proj / "auth.py").read_text(encoding="utf-8")
+          == "def greet():\n    return 'hello'\n",
+          "edit applied before the human decided")
+    proc = env.cli("candidate", "review", cid, "--decision", "accept")
+    check(proc.returncode == 0, proc.stderr)
+    check((env.proj / "auth.py").read_text(encoding="utf-8")
+          == "def greet():\n    return 'hello, world'\n",
+          "accepted edit did not apply the replacement")
+    block = env.clip_text()
+    check("✓ auth.py — UPDATED" in block,
+          f"UPDATED tag missing: {block!r}")
+    check("-    return 'hello'" in block
+          and "+    return 'hello, world'" in block,
+          f"harness-generated diff missing from block: {block!r}")
+
+
 # =======================================================================
 # Matrix runner
 # =======================================================================

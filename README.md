@@ -4,53 +4,16 @@ A human-in-the-loop execution bridge: run AI-chat-proposed commands
 from your clipboard, behind a Claude Code-style hook lifecycle with
 a fail-closed review gate.
 
-You work somewhere the chat model you can use (e.g. M365 Copilot)
-has no tools, no MCP, no shell — it can only talk. But it can
-*write text*, and you can copy that text. clip-harness is the other
-half of that channel: the model proposes commands and file changes
-as clipboard payloads, you hit one hotkey, and the harness executes
-them locally — behind a review gate you control, with a receipt for
-everything, and the result copied back to the clipboard for you to
-paste into the chat. Durable goals survive the chat: lose the
-session, the terminal, the whole conversation, and the work's
-state is still there.
-
-Why not an API or MCP? The chat surface this was built for offers
-neither — the clipboard is the one channel that exists. If your
-model has real tools, you don't need this. If it can only talk,
-this gives it hands, with you on the gate.
-
-```
-  chat ── payload ──▶ clipboard ── hotkey ──▶ clip-harness
-   ▲                                              │ review gate
-   │                                              ▼ (you decide)
-   └────── result block ◀──── execution: shell + files
+```mermaid
+flowchart LR
+    A[chat] -->|payload| B[clipboard]
+    B -->|hotkey| C[clip-harness]
+    C --> D{review gate — you decide}
+    D --> E[execution: shell + files]
+    E -->|result block| A
 ```
 
-## Install
-
-```sh
-pipx install clip-harness
-clip-harness init     # default hooks + starter settings
-```
-
-`clip` is installed as a short alias for `clip-harness`. Updates
-are one explicit command — `clip-harness upgrade` —
-checksum-verified, never silent. No package index where you work?
-Download the wheel from
-[GitHub Releases](https://github.com/millhq/clip-harness/releases),
-verify it against the release's SHA256SUMS, and
-`pipx install ./clip_harness-*.whl`. Details in
-[Updating](docs/cli.md#updating).
-
-## Quick start
-
-1. Wire a hotkey (or run `clip-harness watch`) to the zero-argument
-   trigger: clipboard → run → result back to clipboard.
-2. Paste [AGENTS.md](AGENTS.md) into the chat once — it teaches
-   the model the protocol.
-3. Copy a payload, hit the hotkey, review if asked, paste the
-   result back.
+## See it work
 
 The model emits a payload like:
 
@@ -86,17 +49,26 @@ files:
 No Mac handy? The whole lifecycle runs headlessly:
 `python3 examples/sample_session/run_demo.py`.
 
-## Goal · Plan · Task
+## Install
 
-Three separate things, on purpose:
+```sh
+pipx install clip-harness
+clip-harness init     # default hooks + starter settings
+```
 
-- **Goal** — the objective: a durable anchor with a stable id.
-  Sessions bind to it; it outlives them.
-- **Plan** — a Markdown document the model authors whole. The
-  harness stores it verbatim and never parses it.
-- **Task** — the only tracked execution state (`open` / `doing` /
-  `done`). What is current is read off the task states; there is
-  no stored "current step" that could disagree with them.
+Then paste [AGENTS.md](AGENTS.md) into the chat once — it teaches
+the model the protocol — and wire a hotkey (or run
+`clip-harness watch`) to the zero-argument trigger:
+clipboard → run → result back to clipboard.
+
+`clip` is installed as a short alias for `clip-harness`. Updates
+are one explicit command — `clip-harness upgrade` —
+checksum-verified, never silent. No package index where you work?
+Download the wheel from
+[GitHub Releases](https://github.com/millhq/clip-harness/releases),
+verify it against the release's SHA256SUMS, and
+`pipx install ./clip_harness-*.whl`. Details in
+[Updating](docs/cli.md#updating).
 
 ## Find it fast
 
@@ -112,6 +84,36 @@ Full documentation: **https://millhq.github.io/clip-harness/**
 | Architecture, module map, security model, platform notes | [site](https://millhq.github.io/clip-harness/architecture/) · [source](docs/architecture.md) |
 | Troubleshooting | [site](https://millhq.github.io/clip-harness/troubleshooting/) · [source](docs/troubleshooting.md) |
 | Development | [site](https://millhq.github.io/clip-harness/development/) · [source](docs/development.md) |
+
+## What it is
+
+You work somewhere the chat model you can use (e.g. M365 Copilot)
+has no tools, no MCP, no shell — it can only talk, but it can
+*write text*, and you can copy that text. clip-harness is the
+other half of that channel: the model proposes commands and file
+changes as clipboard payloads, you hit one hotkey, and the harness
+executes them locally — behind a review gate you control, with a
+receipt for everything, and the result copied back to the
+clipboard for you to paste into the chat. Durable goals survive
+the chat: lose the session, the terminal, the whole conversation,
+and the work's state is still there.
+
+Why not an API or MCP? The chat surface this was built for offers
+neither — the clipboard is the one channel that exists. If your
+model has real tools, you don't need this; if it can only talk,
+this gives it hands, with you on the gate.
+
+## Goal · Plan · Task
+
+Three separate things, on purpose:
+
+- **Goal** — the objective: a durable anchor with a stable id.
+  Sessions bind to it; it outlives them.
+- **Plan** — a Markdown document the model authors whole. The
+  harness stores it verbatim and never parses it.
+- **Task** — the only tracked execution state (`open` / `doing` /
+  `done`). What is current is read off the task states; there is
+  no stored "current step" that could disagree with them.
 
 ## License
 

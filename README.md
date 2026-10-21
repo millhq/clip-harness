@@ -1,387 +1,69 @@
 # clip-harness
 
-A **human-in-the-loop execution bridge** for locked-down AI chat setups.
+A human-in-the-loop execution bridge: run AI-chat-proposed commands
+from your clipboard, behind a Claude Code-style hook lifecycle with
+a fail-closed review gate.
 
-You work somewhere the chat model you can use (e.g. M365 Copilot) has no
-tools, no MCP, no shell — it can only talk. But it can *write text*, and
-you can copy that text. clip-harness is the other half of that channel:
-the model proposes commands and file changes as clipboard payloads, you
-hit one hotkey, and the harness executes them locally — behind a
-Claude Code-style **hook lifecycle** with a **fail-closed review gate**,
-JSONL **receipts** for everything, and the result copied back to the
-clipboard for you to paste into the chat.
+You work somewhere the chat model you can use (e.g. M365 Copilot)
+has no tools, no MCP, no shell — it can only talk. But it can
+*write text*, and you can copy that text. clip-harness is the other
+half of that channel: the model proposes commands and file changes
+as clipboard payloads, you hit one hotkey, and the harness executes
+them locally — behind a review gate you control, with a receipt for
+everything, and the result copied back to the clipboard for you to
+paste into the chat. Durable goals survive the chat: lose the
+session, the terminal, the whole conversation, and the work's
+state is still there.
 
-It grew out of a hand-rolled iTerm2 clipboard loop plus a shell-script
-task suite. It is written in Python, not shell, on purpose: shell can't
-hold correctness and contracts even with Bats testing — the hook
-contract here is **enforced in code** (schema-validated input and
-output), modules have clean boundaries, and the whole lifecycle is
-unit-tested headlessly.
+Why not an API or MCP? The chat surface this was built for offers
+neither — the clipboard is the one channel that exists. If your
+model has real tools, you don't need this. If it can only talk,
+this gives it hands, with you on the gate.
+
+```
+  chat ── payload ──▶ clipboard ── hotkey ──▶ clip-harness
+   ▲                                              │ review gate
+   │                                              ▼ (you decide)
+   └────── result block ◀──── execution: shell + files
+```
 
 ## Install
 
 ```sh
-pipx install clip-harness          # or: pip install clip-harness
-clip-harness init                  # installs the default hooks + a
-                                   # starter ~/.config/clip-harness/settings.json
+pipx install clip-harness
+clip-harness init     # default hooks + starter settings
 ```
 
-For iTerm2 tab execution (optional): `pipx install 'clip-harness[iterm2]'`.
-
-The install also puts a short alias on your PATH: **`clip`** is the
-same command as `clip-harness` (two entry points, one main). The
-docs use the canonical name throughout.
+`clip` is installed as a short alias for `clip-harness`. Updates
+are one explicit command — `clip-harness upgrade` —
+checksum-verified, never silent. No package index where you work?
+Download the wheel from
+[GitHub Releases](https://github.com/millhq/clip-harness/releases),
+verify it against the release's SHA256SUMS, and
+`pipx install ./clip_harness-*.whl`. Details in
+[Updating](docs/cli.md#updating).
 
 ## Quick start
 
-1. Wire the trigger: your own Apple Shortcut/hotkey (e.g. Cmd+Shift+E)
-   that opens iTerm2, plus an iTerm2 hotkey whose fixed sequence runs
-   `clip-harness` with
-   **no arguments**. Zero arguments is the static trigger path: read
-   clipboard → parse → run → result back to clipboard. Everything
-   variable comes from the payload block itself.
-2. In the chat, paste the model [AGENTS.md](AGENTS.md) once so it
-   learns the protocol.
-3. Copy a payload the model emits, hit the hotkey, review if asked,
-   paste the result back.
+1. Wire a hotkey (or run `clip-harness watch`) to the zero-argument
+   trigger: clipboard → run → result back to clipboard.
+2. Paste [AGENTS.md](AGENTS.md) into the chat once — it teaches
+   the model the protocol.
+3. Copy a payload, hit the hotkey, review if asked, paste the
+   result back.
 
-Or run the daemon form: `clip-harness watch` (add `--backend iterm2`
-inside iTerm2's Python runtime for in-tab execution).
-
-Try the whole thing headlessly first — no Mac required:
-
-```sh
-python3 examples/sample_session/run_demo.py
-```
-
-## Architecture
-
-**The core is thin and is purely a mapping layer onto known tools.**
-It does not reimplement what a tool already does: patching is `git
-apply`, the clipboard is `pbpaste`/`pbcopy`, diffs are `code --diff`,
-the shell is the user's shell, notifications are whatever posts them.
-
-**Hooks are the extension mechanism.** Behaviour is added by placing a
-hook at a lifecycle point, configured in a settings file — never by
-growing the core. Anything beyond parsing, lifecycle dispatch, the
-session registry, receipts, the goal/task store, and tool mapping
-ships as a hook point plus (where sensible) a default hook
-implementation.
-
-**Behaviour that must ALWAYS happen lives in the core; hooks are only
-for optional extension.** The canonical example is the goal/task nag
-(below): it is generated by the core on every bound run because a nag
-that depends on an optional, removable, fail-open hook is not a nag.
-
-Two consequences worth naming:
-
-- **Notifications are hooks, not a core feature.** The core emits
-  lifecycle events; a notification is a hook placed at whichever point
-  you want one (completion, failure, review-pending, session end).
-  `clip-harness init` installs default notify hooks so it feels
-  complete out of the box while remaining pure extension.
-- **The review decision is NOT a notification.** Capturing the human's
-  accept/reject is transport — part of executing the flow — so the
-  decider is a core adapter. ReviewDecision *hooks* may observe it
-  (that's where a "review pending" notification lives), but they never
-  override explicit decision data.
-
-### Module map
-
-| module | responsibility |
-|---|---|
-| `payload` | the parser — the one place that knows the block protocol |
-| `core` | shared types, limits, result formatting |
-| `contract` | the hook input/output schemas, enforced in code |
-| `hooks` | matcher rules + dispatch (exit-code/decision semantics) |
-| `gate` | built-in policy; candidate staging, classification, reviewed apply |
-| `runner` | the lifecycle state machine |
-| `sessions` | the session registry (binding, cancel/rerun addressing) |
-| `receipts` | the JSONL ledger + markdown transcript |
-| `goals` | the session-bound view over the durable goal store |
-| `goalstore` | the durable goal store: goal/plan/task as files, revisions, CAS, action-id idempotency, export/import, migrations (0.2.x SQLite ledger, legacy session files) |
-| `manifest` | the capability manifest (built-ins + hook-registered tools) |
-| `settings` | user/project settings, merged Claude Code-style |
-| `updater` | the throttled update check + the checksum-verified self-upgrade |
-| `executor` | the local subprocess backend |
-| `adapters/` | tool mapping: macOS (pbpaste/pbcopy, VS Code), iTerm2 watch, headless stand-ins |
-| `defaults` | the shipped default hooks installed by `clip-harness init` |
-| `cli` | the command surface |
-
-There is no shell-script runtime dependency anywhere in this table —
-and no mise in the CLI's runtime path; if mise appears at all, it is
-as an optional wrapper in *your* shell config, never a requirement.
-
-## The payload protocol
-
-> **This section is the single source of truth for the protocol.**
-> [AGENTS.md](AGENTS.md) — the instructions you give the chat model —
-> is derived from it; keep the two in sync (a SKILL.md rendering can
-> be generated from the same source later).
-
-Detection is a ladder — the fence/metadata layer is progressive
-enhancement over "whatever is on the clipboard runs", never a
-requirement for the simple case:
-
-1. **```shell fence** — commands with a metadata header.
-2. **```file / ```patch / ```edit fences** — proposed file changes.
-3. **Unfenced contents beginning with a metadata header** — the
-   shell fence's contents standing alone, when the fence was lost
-   in copying (see "When the fence is lost in copying", below).
-4. **Unfenced contents beginning with a `path:` header** — the
-   ```file / ```patch / ```edit fences' contents standing alone,
-   under stricter recognition rules (same section, below).
-5. **Bare clipboard text** — treated as a single unbound command
-   (only on the explicit trigger path; the passive `watch` loop never
-   auto-runs bare text).
-
-### The ```shell fence
+The model emits a payload like:
 
 ````
 ```shell
 session: auth-refactor
-action: run the tests
-cwd: ~/work/api
-timeout: 300
 npm test
 ```
 ````
 
-Leading `key: value` lines are the metadata header; the rest is shell
-text. Recognised keys:
-
-- `session:` — binds the run to that session id: addressable for
-  cancel/rerun, receipts keyed by it, and its result blocks carry the
-  goal/task standing section and capability-manifest refreshes.
-  **No `session:` → the run is unbound but still runs.** A missing id
-  never blocks execution.
-- `action:` — `run` (default); the core goal/task operations
-  `goal-set`, `goal-status`, `task-add`, `task-update` (these
-  require a session, or a `goal:` header) and the read-only
-  `goal-list` / `goal-show` (no session needed). `task-update` is
-  the only status-change form: its body is one
-  `<status>: <exact task title>` line per transition (status
-  `done` / `doing` / `open`), and the batch applies atomically —
-  every title is validated first, and an unknown, duplicated or
-  conflicting title rejects the whole batch with nothing applied.
-  (Migration: the single-task `task-doing` / `task-done` /
-  `task-open` actions were removed; a payload naming one gets a
-  static migration error pointing at `task-update`.)
-- `cwd:` — working directory override.
-- `timeout:` — per-command timeout in seconds.
-- `attend:` — `true` opts this run into attended mode (below);
-  anything else, or absent, is async.
-- `writes:` — comma-separated paths the command declares it may
-  write (relative entries resolve against the effective cwd). The
-  declaration scopes the sandbox when the command is held for
-  review (see *Reviewed shell commands* below); an empty value is
-  malformed and fails closed.
-- `goal:` — a durable goal's `goal_uid`: binds the payload to that
-  goal (its footer projects from the goal's record; goal/task
-  actions target it). An unknown uid is refused — discover goals
-  with `action: goal-list`. See *Durable goals* below.
-- `expect-revision:` — the compare-and-swap guard: an integer. A
-  goal mutation proceeds only while the goal's current revision
-  equals it (a stale writer is rejected, naming both revisions);
-  on a plain run bound to a goal it asserts the revision, and a
-  mismatch denies the run. A non-integer value is malformed.
-- `action-id:` — an idempotency key (a uuid) for the whole
-  payload. If the id was already applied, the payload is rejected
-  as a duplicate — before anything executes or mutates — with the
-  original outcome named. An empty value is malformed.
-
-(```run is accepted as a legacy alias for ```shell.)
-
-### When the fence is lost in copying
-
-The canonical form is the fence — models emit fences, always. But
-some chat UIs strip the outer fence when the human copies with the
-block's copy button (Microsoft 365 Copilot does this), leaving the
-block's contents on the clipboard. The harness therefore also
-recognises those contents standing alone: text that **begins** with
-a metadata header — a contiguous run of recognised `key:` lines from
-line 1 — parses as that shell payload. The header is consumed as
-metadata and never passed to the shell; the remaining lines are the
-command, and goal/task `action:` payloads work identically. Bound
-runs get the same manifest and sticky footer as fenced runs.
-
-The mutation fences get the same tolerance, under stricter rules.
-Text whose first line is an exact `path:` header is the ```file,
-```patch or ```edit fence's contents when what follows
-disambiguates it: an explicit `op:` line makes it a file payload —
-file.write **requires** that op in this form, and the unfenced form
-is stricter than the fence: the op must be `create`, `update` or
-`delete` (`auto` is fenced-only), create/update require the file
-content as a non-empty body, and delete requires an empty body. A
-body beginning with a unified-diff header (`---` then `+++`) makes
-it a patch payload. (The op wins if both are present: a file
-whose content is itself a diff is legitimate.) A following
-`replace_all:` line or an exact `old_string:` line makes it an
-edit payload, parsed with the same strictness as the fence — a
-malformed edit fails closed here too, never falling through to
-bare shell text. The payload then flows through the identical
-staging, review and apply path as a fenced one — same manifest,
-same base-hash checks, same traversal rejection at staging.
-
-This is a tolerance for a copying artifact, not a second format:
-
-- Text that does not begin with a recognised metadata line is not
-  an unfenced payload — it is bare text (rung 5), as before. An
-  unrecognised first line (e.g. `foo: bar`) starts no header.
-- A recognised key with an invalid value inside the header
-  (`timeout: soon`, `attend: maybe`) is malformed metadata: the
-  payload is rejected and nothing executes — it never falls back
-  to running the header as shell text.
-- A metadata line appearing after the command body has begun is
-  ordinary shell text, never re-parsed.
-- Metadata with no command body is rejected.
-- A `path:` header followed by neither a valid `op:` line nor a
-  diff header is malformed: rejected, never treated as bare shell
-  text, never staged. An `op:` line with any other value is
-  malformed the same way. A `path:` line appearing after a shell
-  body has begun is ordinary shell text.
-
-### Execution modes
-
-Wherever a human is in the loop, the review is taken in the
-terminal — and plain runs are fire-and-forget: the human is never
-blocked waiting on output.
-
-- **Trigger / `run` (interactive).** Firing the trigger (or
-  `clip-harness run`) puts you in the loop: a payload with file
-  changes is staged, the review surface (manifest, then inline
-  diffs) is presented in the terminal, and the decision is taken
-  in the same invocation — accept, accept-edited, reject, or
-  *defer*. The prompt also offers a VS Code view of the candidate;
-  it opens only when you pick it — and in the editor, saving is
-  the decision (see the review gate below).
-  This holds for attended payloads and pure file/patch payloads
-  alike. Plain commands just run.
-- **Live run visibility (trigger / `run`, at a terminal).** While
-  a command executes, the terminal shows a header — the command,
-  its cwd, the bound session, the timeout — and then the output
-  itself as it is produced, with a `… running Ns` heartbeat when
-  the command goes quiet; the run's `output.txt` fills as it goes,
-  so `tail -f` works mid-run too. This is a view, not a second
-  artifact: the result block still arrives complete at the end,
-  byte-for-byte what a silent run produces, and the clipboard,
-  receipts and files never see the header or the heartbeat. The
-  watch loops and non-terminal invocations don't stream.
-- **Parked (deferred / watch).** Deferring at the trigger prompt —
-  or any payload with file changes under the `watch` loops, which
-  never prompt — **parks** the run: the candidate is staged, the
-  `ReviewDecision` *pending* notification fires, and the run waits
-  in `pending_review`. The decision arrives later (`candidate
-  review` / `decide` / `apply`, or a `decision.json` drop); only
-  then do apply, receipt, clipboard, and the completion
-  notification happen. For a parked review, rejecting *is* the
-  steering. A held shell command parks the same way, as a command
-  candidate (see *Reviewed shell commands* below).
-- **Attended (`attend: true`).** The payload itself demands the
-  inline wait in any context that has a decision window — e.g.
-  the iTerm2 watch's `decision.json` drop — for the runs where the
-  human wants to sit in the loop even where the entry point would
-  otherwise park. `cancel` steers a running command in every mode.
-
-### File fences — the mutation branch
-
-One copied message may carry several fences: one ```shell fence plus
-one fence per file. A file fence carries the FULL content — the human
-reviews the actual bytes as an inline diff in the terminal (below),
-never a description in the chat:
-
-````
-```file
-path: src/auth.py
-op: update
-<full file content>
-```
-
-```patch
-path: src/tokens.py
-<unified diff>
-```
-````
-
-`op:` is optional (`create`/`update`/`delete`); the gate classifies
-each file against disk — **NEW / UPDATE / DELETE / NO-CHANGE** — and
-flags declared-vs-actual mismatches. File fences with no shell fence
-are a pure mutation payload; a header-only shell fence binds one to a
-session. For ```patch fences, `path:` is the authoritative target:
-the diff's `---`/`+++` header filenames are checked against it and
-normalized to it before application, whatever shape they arrive in.
-
-### The ```edit fence — exact-text edits
-
-For a change to an existing file, prefer ```edit over ```patch:
-the model supplies exact text instead of a hand-counted diff, and
-the harness computes the candidate bytes and generates the review
-diff itself:
-
-````
-```edit
-path: src/auth.py
-replace_all: false
-old_string:
-def old():
-    return 1
-new_string:
-def new():
-    return 2
-```
-````
-
-The rules mirror Claude Code's Edit tool, which this maps onto:
-
-- `path:` is required and first — the authoritative target,
-  exactly like the other mutation fences.
-- `replace_all:` is an optional header line (Claude Code's exact
-  parameter name); only the literal values `true` / `false` are
-  valid — anything else is malformed and fails closed. Default
-  `false`.
-- The sections are delimited by lines that are exactly
-  `old_string:` and then exactly `new_string:` — the first
-  `new_string:` line after `old_string:` is the delimiter. A
-  section's text is its lines joined with newlines, with no
-  trailing newline.
-- Matching is exact, whitespace included, against the live file
-  (which must decode as UTF-8). The gate fails the staging when
-  `old_string` occurs zero times (the remedy: copy the exact
-  current text, whitespace included, and re-send), or more than
-  once without `replace_all: true` (the remedies: include more
-  surrounding context to make it unique, or set `replace_all`).
-  `old_string` equal to `new_string` fails too — there is nothing
-  to change.
-- An empty `new_string:` section is valid: it **deletes** the
-  matched block. An **insert** is expressed inside the same one
-  operation — `new_string` carries the anchor text plus the new
-  text. There are no other edit operations.
-- An empty `old_string`, a missing section marker, or an `op:`
-  line is malformed and fails closed. An edit **never creates a
-  file** — its target must already exist; creation is the ```file
-  fence's job, and the staging error says so.
-- **One edit per file per payload:** a second spec for the same
-  path where at least one is an edit is rejected at staging. Like
-  sequential Edit calls, the next edit goes in the next payload,
-  after the result; a multi-part change to one file travels as a
-  single ```file fence or a single valid ```patch.
-- If the text being edited itself contains a literal line that is
-  exactly `old_string:` or `new_string:`, the section markers
-  collide — send that change as a ```file fence instead.
-- ```patch stays for pre-generated, known-valid diffs (produced
-  by a tool, not hand-written). A patch whose @@ header counts
-  don't match its body fails staging with a diagnostic naming,
-  per offending hunk, the declared vs actual old/new counts —
-  and the error points back here: fix the @@ counts, or re-send
-  the change as an ```edit fence.
-
-### Control triggers
-
-Single-line, as in the original loop: `` ```cancel``` `` /
-`` ```cancel id=<session>``` `` and `` ```rerun``` `` /
-`` ```rerun id=<session>``` ``.
-
-### The result block
+…and you paste back one result block — the same bytes in your
+terminal and on the clipboard, ending with the goal footer that
+re-anchors both of you:
 
 ````
 ```result
@@ -396,549 +78,40 @@ files:
      unchanged context
     -old line
     +new line
-— capabilities:
-  ...
 [goal] Ship the auth refactor [active] (3f9a1c2e)
 [open tasks] [doing] wire tokens · [open] update tests
 ```
 ````
 
-**One artifact, two audiences.** The result block is a single shared
-artifact: the text rendered in the terminal and the text on the
-clipboard are the *same bytes* — what the human sees is exactly what
-the model reads when it is pasted back. There is no prettier human
-version and no separate machine version.
-
-- The `files:` section appears when a mutation was decided, with
-  NEW/UPDATED/DELETED tags (and ✗ lines for rejected entries). Each
-  entry is followed by its **inline diff** — applied and rejected
-  alike — so the paste-back shows the model its own proposal exactly
-  as rendered and what happened to it. Diffs are capped per file
-  (80 lines / 6000 chars) with a `… N more lines — full diff in
-  <candidate dir>` pointer.
-- **Sticky footer.** Every session-bound block ENDS with the same
-  lines in the same position: `[goal] …` then `[open tasks] …`.
-  The `[goal]` line is projected from the durable goal record —
-  goal text, status, and the goal's short uid. There is no
-  `[step]` line: nothing stores a "current step" — the task in
-  progress shows as `[doing]` inside `[open tasks]`. The footer is
-  **core-generated** (never hook-supplied) and appears in every
-  bound block, hooks or no hooks, so both the human and the model
-  are re-anchored on the goal and the open tasks every round trip.
-  Hook `additionalContext`, capability-manifest refreshes, and
-  pending state all sit *above* the footer; the footer is always
-  last. Unbound runs carry neither the footer nor manifest
-  refreshes. One more line may sit immediately above the footer
-  (or end an unbound block): the `[update]` notice, when a newer
-  release is available (see *Updating*).
-- A rejection puts plain rejection text on the clipboard instead
-  (the rejected diffs included, marked rejected, with the reason),
-  ready to paste back so the model can re-propose.
-
-### Oversized output
-
-A command's full output is always preserved byte-for-byte at
-`<state_dir>/runs/<run_id>/output.txt`. What goes into the result
-block is bounded by the `result_budget_chars` setting (default
-100,000): output past the budget is elided to a head + tail digest
-around one marker line —
-
-`[output elided: N of T chars shown · full output (T chars) saved at <path> · page it with: sed -n 'A,Bp' <path> · grep <path> · tail -c E <path>]`
-
-The default leaves room inside a 128k-capped chat message (Microsoft
-365 Copilot's per-message limit) for your own words and the block's
-footer; set the budget for whatever surface you paste into. Nothing
-is lost and no re-run is needed: the model pages the stored file with
-ordinary shell commands in a follow-up payload, so the bulk never
-occupies its context — it stays addressable instead.
-
-## Durable goals (core)
-
-Goal, plan and task are three different things here — the
-separation Anthropic's Claude Code model converged on — and the
-harness keeps them separate:
-
-### Goal — the anchor
-
-A goal is the objective that frames the work: a durable object
-with a stable id, referenced by sessions, never owned by them.
-Its record carries only anchor fields: `goal_uid` (harness-issued
-uuid4, immutable, never derived from the session name or the goal
-text), `human_id` (a readable slug), the verbatim goal text,
-`status` (`waiting` / `active` / `paused` / `complete` /
-`branched`), `revision` (starts at 1, +1 on every mutation),
-`latest_result`, free-form `provenance`, and timestamps. A goal
-holds no plan and no tasks — it anchors them. Sessions hold only
-a **binding** (session id → goal_uid): lose the chat, the
-terminal and the session, and the goal is still there —
-`goal-list` rediscovers it, `goal-show` reconciles it, by exact
-uid.
-
-### Plan — a document
-
-A plan is a Markdown **document**: at most one per goal, authored
-whole, replaced whole. This is Anthropic's shape — in Claude
-Code a "plan" is the plan-mode document, not a data structure.
-The model writes it with `action: plan-set` (the payload body IS
-the document) and reads it back verbatim with
-`action: plan-show`; the harness stores and returns it exactly
-as written and never parses steps, statuses, or structure out
-of it. A plan's version identity ("PLAN v2") is the document's
-own content — its title line — not schema. `goal-show` points at
-the plan (exists? + title line) without embedding it.
-
-### Task — the tracked work
-
-A task is the only tracked execution state: its own object,
-belonging to a goal — `task_id` (harness-issued, stable), the
-`goal_uid`, a title, a `status` (`open` / `doing` / `done`), and
-an integer `position`. There is no "current step" cursor
-anywhere: which task is current is read off the task states
-(the one marked `doing`), never stored separately where it
-could disagree with them. Tasks are created with `task-add`
-(positions assigned after the current maximum) and their
-statuses change only through `task-update` — one atomic batch
-of `<status>: <exact task title>` lines per payload.
-
-### The store is files
-
-The durable store is plain files under `<state_dir>` —
-Anthropic's literal mechanism (their tasks are JSON files in a
-folder; the folder is the store):
-
-```
-goals/<goal_uid>/goal.json          the goal record
-goals/<goal_uid>/tasks/<id>.json    one file per task
-goals/<goal_uid>/plan.md            the plan document (if any)
-goals/<goal_uid>/actions.jsonl      applied action-ids (replay log)
-bindings/<session_id>.json          session -> goal_uid
-```
-
-Writes go to a temp file in the same directory and land with an
-atomic rename; a batch validates fully before anything is
-written; each goal's mutations are serialized by a per-goal
-lock, so concurrent harness processes cannot corrupt or lose
-each other's updates (a lock that cannot be acquired within
-~15s fails loudly, naming the lock path — it is never stolen).
-Still zero third-party dependencies.
-
-Two guards ride the mutations:
-
-- **Compare-and-swap.** A payload carrying `expect-revision: N`
-  mutates the goal only while its revision is N; a stale writer
-  is rejected with both revisions named and nothing applied.
-- **Idempotency.** A payload carrying `action-id: <uuid>` that
-  was already applied is rejected as a duplicate before anything
-  executes or mutates, with the original outcome named. Action
-  ids are scoped per goal when a goal is involved, then per
-  session, then global.
-
-From the terminal:
-
-```sh
-clip-harness goal --session auth-refactor set "Ship the auth refactor"
-clip-harness goal --session auth-refactor task-add "wire tokens"
-clip-harness goal --session auth-refactor task-update "wire tokens" doing
-clip-harness goal --session auth-refactor show          # the bound goal
-clip-harness goal list                                  # every durable goal
-clip-harness goal show <goal_uid>                       # one goal
-clip-harness goal export <goal_uid>                     # JSON, to stdout
-clip-harness goal export --all --out backup.json
-clip-harness goal import backup.json
-```
-
-From the chat side, via `action:` payloads (see the manifest):
-the first `goal-set` in a session creates the durable goal and
-returns its `goal_uid` in the result block. `goal-list` /
-`goal-show` are the read-only discovery pair; `plan-set` /
-`plan-show` carry the plan document. Every bound result block's
-sticky footer projects from the durable record (session state
-never overrides it).
-
-**Export / backup.** `goal export` writes a versioned JSON
-document — `{"format": "clip-harness/goal-export@2", "goal":
-{…anchor fields…}, "tasks": [{title, status}…], "plan":
-"<markdown or null>"}` (or `"goals": […]` of such bundles with
-`--all`). That document IS the backup format and the import
-format: `goal import` validates it, preserves uid, revision,
-status, provenance and timestamps exactly, recreates the tasks
-as fresh task objects in position order, stores the plan
-verbatim, and refuses to overwrite an existing `goal_uid` (the
-refusal names it). Applied action history is NOT exported — an
-import starts a fresh replay log in the new store. The retired
-`@1` format is no longer imported: an `@1` document gets an
-error naming the situation and pointing at `@2`. Export is
-backup/restore only — day-to-day, a goal can equally be
-recreated from scratch through payloads (`goal-set` +
-`plan-set` + `task-add` + `task-update` is a lossless create
-path now).
-
-**One-time storage migrations.** Both run automatically on
-first store open, under a store lock (two processes starting
-together cannot double-import):
-
-- A 0.2.x SQLite ledger (`<state_dir>/goals.db`) is read once
-  and written out as the file layout: the plan dict is rendered
-  to a Markdown document (title line from its revision label,
-  one `N. [status] title` line per step — a rendering, whose
-  content is user/model-owned from then on), tasks become task
-  files, backlog entries become open tasks appended after them
-  (the backlog field itself is deleted), and bindings and
-  applied action-ids carry over. The database is renamed
-  `goals.db.migrated` and never read again.
-- Pre-0.2.0 per-session JSON files (`<state_dir>/goals/
-  <session>.json`) migrate as they always did — fresh uid, the
-  session binding recorded, legacy status `done` → `complete`,
-  source renamed `.migrated` — except sessions the SQLite
-  migration already bound are skipped (their file is still
-  renamed, never re-read).
-
-## Capability manifest
-
-The manifest is the discovery mechanism by which the chat model gains
-capabilities over the clipboard transport: a compact list of the
-tools it may invoke, each with the block shape that invokes it
-(`shell.run`, `file.write`, `file.edit`, `patch.apply`,
-`session.cancel`, `session.rerun`, `goal.set`, `goal.list`,
-`goal.show`, `task.add`, `task.update`, …). The core
-generates it for the built-ins; settings may declare more under
-`"tools"`; and **hooks may register additional tools at runtime** via
-`registeredTools` in their output — a registered tool appears in the
-manifest from then on, refreshed into the next bound result block.
-
-## Hook lifecycle
-
-The lifecycle is modelled on Claude Code's hooks, mapped onto the
-harness (one dispatcher, `clip-harness hook --event <Event>`, one JSON
-object in on stdin, at most one JSON object out on stdout, diagnostics
-to stderr):
-
-| event | when | analogue |
-|---|---|---|
-| `SessionStart` | harness armed: ledger init, tool check, env/cwd snapshot | SessionStart |
-| `PayloadCaptured` | clipboard captured: hash + timestamp + raw bytes receipted **first**; empty/oversized/non-text rejected | UserPromptSubmit |
-| `PreRun` | the gate: parse/classify, allowlist/denylist, protected paths, destructive patterns → allow/deny/ask/rewrite | PreToolUse |
-| `ReviewDecision` | the mutation branch: candidate staged, human decision captured as explicit data | PermissionRequest |
-| `PostRun` | receipt with the *executed* input + response + duration — written **before** the clipboard is overwritten | PostToolUse |
-| `PostRunFailure` | a **separate** event (not a flag): failure receipt; partial applies roll back from base-hash snapshots | PostToolUseFailure |
-| `RunClosed` | refuses a “clean” close while a candidate decision is pending — the run is left in a recorded pending state | Stop |
-| `SessionEnd` | ledger summary | SessionEnd |
-| `ConfigChange` | allowlist/hook-config edits made while armed, receipted as their own events | ConfigChange |
-
-### The contract
-
-- Input fields: `session_id`, `run_id`, `hook_event_name`, `cwd`,
-  `clipboard_sha256`, `tool_name` (`Bash` for commands; reclassified
-  `Write`/`Edit`/`Delete` for the mutation branch), `tool_input`,
-  `tool_use_id`; post events add `tool_response` or `error` +
-  `duration_ms`. Both input and output are **validated against the
-  schemas in `clip_harness/contract.py`**; a schema violation is a
-  hook error.
-- Decisions via `hookSpecificOutput`: `permissionDecision`
-  (`allow`/`deny`/`ask`), `permissionDecisionReason`, `updatedInput`
-  (replaces the *whole* input; the allowlist is re-checked against
-  the rewritten input), `updatedToolOutput` (PostRun only — rewrites
-  the clipboard copy; the receipt keeps the true output),
-  `additionalContext`, `registeredTools`.
-- Exit codes: `0` = proceed (the JSON may still deny/ask/rewrite);
-  `2` = hard block, evaluated before the allowlist, stderr is the
-  reason, and it wins over a JSON `allow`; any other exit, a crash, a
-  timeout, or unparseable/schema-violating output = **hook error**.
-- **The deliberate deviation:** gate hooks (`PayloadCaptured`,
-  `PreRun`, `ReviewDecision`, `RunClosed`) **fail closed** — a gate
-  hook error means the payload does *not* run, with the reason in the
-  receipt (Claude Code's `onFailure: "block"` behaviour, made the
-  default). Observational hooks fail open.
-- Hooks are command handlers in a settings file (below), with Claude
-  Code-style matchers on tool name (exact/`|`-lists, or regex), an
-  optional `if` glob on the command text, and per-hook timeouts.
-- A review that produces no decision in its window leaves the run
-  **PENDING** with the candidate intact — never auto-applied, never
-  silently discarded. Complete it later with
-  `clip-harness candidate review <id>`.
-
-### The review gate (§7.3 flow)
-
-File payloads are never written live. The gate classifies each file
-against disk, stages candidates with base hashes and a manifest, and
-the review surface presents the **manifest first** (path · op · line
-counts), **then each change as an inline unified diff** in the
-terminal — a create renders as a full addition, a delete as the
-removed content, an update as a compact diff with context lines,
-each capped with a pointer to the candidate directory for the full
-diff. That inline diff is the default review surface; VS Code
-(`code --diff` per update, the candidate for creates, the live file
-for deletes) remains available as the deep-review option for the
-same staged candidate — offered inside the terminal prompt and
-opened only when the human picks it; it never opens on its own.
-On the trigger / `run` paths the surface is presented inline at
-staging time and the decision is taken in the same invocation
-(deferring parks the run); under the watch loops the run parks
-and the surface is presented when the human comes to decide
-(`candidate review` / `candidate show`); an `attend: true`
-payload forces the inline wait wherever a decision window exists.
-The
-decision is captured as data (`decision.json`: `accept` /
-`accept-edited` / `reject` + optional reason + optional per-file
-`accepted_files`). Apply runs only on accept, applies only accepted
-entries, verifies post-apply hashes, and rolls back from the
-pre-apply snapshots on partial failure. On reject: no post hooks
-fire, the receipt records the denial, and the clipboard gets the
-rejection text (rejected diffs included).
-
-Picking the VS Code view waits for the editor: the candidate
-opens in a single `code --wait` session (manifest first, then the
-diffs), and the contract is *save + close = apply your edits* —
-if any staged copy's content differs when VS Code closes, the
-review concludes on the spot as `accept-edited` and applies your
-edited bytes, for the whole candidate (per-file picks remain a
-terminal-prompt capability). Close without saving and nothing
-was decided: you are back at the terminal prompt. A delete's
-live file is view-only in the editor — changing it does not
-count as an edit, and the gate's stale-base check still guards
-the apply.
-
-Built-in policy runs before hooks: hard-block patterns are evaluated
-**before** the allowlist (exit-2 semantics); a denylist match denies;
-a non-empty allowlist that doesn't match asks; shell commands that
-look like mutations ask under `mutation_gate: "review"` (the default)
-so file changes can travel as reviewable fences instead. An explicit
-allowlist **hit** is the human's standing approval: it approves the
-command outright (this is what a review's *always allow* persists —
-below). A mutation the gate holds is not a dead end, though: the
-command itself is reviewable, as the next section describes.
-
-### Reviewed shell commands
-
-Some commands cannot be predeclared as file fences — a supplier
-script that *generates* its outputs, a build, a code generator.
-When the gate's verdict on a shell command is **ask** (a mutation
-under `mutation_gate: "review"`, or a command not on the allowlist),
-the run pauses for a decision instead of executing, wherever the
-command appears: bare, or as the shell part of a mixed payload
-(after its files are accepted). The command is staged as a
-**command candidate** in the same candidates store as file
-candidates (manifest kind `"command"`: the command, cwd, timeout,
-session, declared `writes:`, the gate's reason, and the clipboard
-hash) and the review surface shows:
-
-- the full command, its cwd, session (when bound) and timeout;
-- the gate's reason for holding it;
-- the declared write scope — or, with no `writes:` header, that
-  writes are confined to the working directory + temp;
-- the protected carve-outs (below) that no accept can override.
-
-Decisions, at the terminal prompt or as recorded decision data:
-
-- **accept** — execute under the sandbox (the default accept);
-- **accept unsandboxed** — execute bare. Offered only when the
-  `shell_sandbox` setting is `"optional"` (the default);
-  `"strict"` removes it entirely, from the prompt and from recorded
-  decisions alike;
-- **always allow** — accept sandboxed AND persist an allowlist
-  pattern derived from the command (first token + ` *`, shown in
-  the prompt, e.g. `suppliers/openapi/discover *`) into the
-  **project** settings (`.clip-harness/settings.json` under the
-  cwd, other keys preserved; a ConfigChange is recorded), so future
-  runs of that shape evaluate ALLOW and are not held;
-- **reject** (+reason) — nothing runs; the denial result carries
-  the reason back to the model;
-- **later** — no decision: the run parks in `pending_review` as a
-  command candidate, exactly like a file candidate. The clipboard
-  note names the mechanism: `clip-harness candidate review <id>`.
-  `candidate list` / `show` present it as a command with its scope
-  and reason; `candidate review` offers the same decisions and
-  executes an accepted command through the runner (PostRun hooks,
-  bound footer, result block); `candidate review --decision`
-  accepts `accept` (= sandboxed), `accept-unsandboxed` and
-  `reject` for command candidates. `candidate decide` records a
-  decision for a later `candidate apply`, as with files — one
-  difference: for a command candidate, *apply* means **execute the
-  approved command** (there are no files to write).
-
-**The sandbox (macOS Seatbelt).** A sandboxed execution is wrapped
-in `sandbox-exec -p <profile>` at process spawn; supervision,
-timeout and cancel are unchanged. The profile is a pure function of
-(cwd, declared writes, temp dirs, config dirs): reads are broadly
-allowed; file writes are denied by default, then allowed for the
-effective cwd, each declared `writes:` path, and the temp dirs;
-hard write-denies that no allow overrides sit inside those roots —
-`<cwd>/.git/hooks`, `<cwd>/.git/config`, the user's clip-harness
-config dir, and `<cwd>/.clip-harness`. Process exec/fork is
-allowed. Non-goals in this slice: **network is unrestricted** (no
-network rules are emitted), and the sandbox is **macOS Seatbelt
-only** — where `sandbox-exec` is unavailable, a sandboxed accept
-**fails closed** with a clear result-block error and nothing runs;
-the human's recourse is an explicit unsandboxed accept.
-
-The result block of a reviewed run records the approval on the
-command line — `$ make evidence (reviewed · sandboxed)` — the one
-annotation a reviewed run adds. Hard blocks (destructive patterns,
-protected-path mutations, the denylist) stay unreviewable denials,
-and `mutation_gate: "deny"` stays a flat denial: neither can be
-approved at review.
-
-### Settings
-
-User scope `~/.config/clip-harness/settings.json` + project scope
-`.clip-harness/settings.json`, merged like Claude Code's: handler and
-list settings concatenate (user first), scalars are overridden by the
-project. See [examples/settings.example.json](examples/settings.example.json).
-
-```json
-{
-  "timeout": 120,
-  "allowlist": ["git status", "ls *"],
-  "denylist": ["sudo *"],
-  "protected_paths": [".env", "~/.ssh"],
-  "hard_block_patterns": ["rm\\s+-rf\\s+/"],
-  "mutation_gate": "review",
-  "shell_sandbox": "optional",
-  "result_budget_chars": 100000,
-  "color": "auto",
-  "hooks": {
-    "PreRun": [{"matcher": "Bash", "command": "~/hooks/check.py", "timeout": 10}],
-    "PostRun": [{"matcher": "*", "command": "~/hooks/notify.py"}]
-  }
-}
-```
-
-State (receipts, sessions, candidates, and the durable goal
-goal store) lives in `~/.local/state/clip-harness`
-(override with `"state_dir"`).
-
-**Terminal color.** Diffs printed to a terminal — the review
-presentation, `candidate show`, printed result blocks — are colorized
-at print time: additions green, deletions red, file/hunk headers
-cyan. Color lives only in the rendering; the text itself (clipboard,
-result blocks, receipts, files) always stays plain. Control it with
-the `"color"` setting: `"auto"` (default — color only when stdout is
-a TTY), `"always"`, or `"never"`. The `NO_COLOR` environment variable
-forces color off regardless of the setting.
-
-## CLI surface
-
-```
-clip-harness                      # zero-arg trigger: clipboard -> run -> clipboard
-clip-harness watch [--backend local|iterm2]
-clip-harness run (--clipboard|--stdin|--file F|--command C) [--session ID]
-clip-harness hook --event PreRun  # the hook dispatcher (JSON in/out)
-clip-harness init                 # default hooks + starter settings
-clip-harness goal --session ID set|show|status|task-add|task-update|task-list
-clip-harness goal list|show UID|export [UID|--all]|import FILE
-clip-harness candidate list|show|review|decide|apply [ID]
-clip-harness sessions             # bound sessions
-clip-harness cancel [ID]          # bound id, or the last run
-clip-harness rerun [ID]
-clip-harness finish [--run ID|--session ID] [--copy]
-clip-harness receipt [--run ID] [--tail N] [--summary]
-clip-harness version [--check]    # --check: a fresh update check
-clip-harness upgrade              # verified self-upgrade (see Updating)
-```
-
-Headless use (tests, demos, CI): set `CLIP_HARNESS_CLIPBOARD_FILE` to
-use a file as the clipboard, and wire hook commands that log instead
-of notifying. `examples/sample_session/run_demo.py` runs the full
-lifecycle this way.
-
-## Updating
-
-The harness never updates itself silently — a tool whose job is
-reviewing what executes does not change underneath a session. The
-pattern is the converged dev-tool one (gh, npm, rustup): notify
-in-band, upgrade on one explicit, verified command.
-
-- **The notice rides the result blocks.** At most once a day the
-  harness checks the release feed — GitHub Releases'
-  `/releases/latest/download/SHA256SUMS`, no token, no account —
-  and caches the verdict in `<state_dir>/update-check.json`. When a
-  newer release exists, result blocks gain one line immediately
-  above the sticky footer (or at the end of an unbound block):
-
-  `[update] clip-harness 0.3.0 is available (you run 0.2.1) — upgrade with: clip-harness upgrade`
-
-  The model reading the block back sees it too, so it can tell you
-  you're behind. An unreachable feed means no line and no error:
-  the check never fails, delays, or otherwise touches a run.
-- **`clip-harness upgrade`** does the swap. It reads the latest
-  release's SHA256SUMS, downloads the wheel, and **verifies its
-  sha256 before installing anything** — a mismatch, or a feed
-  naming no wheel, aborts with nothing installed. The verified
-  wheel installs into the current environment with the current
-  interpreter (the pipx venv the harness itself runs in), which
-  also regenerates the `clip` alias; the new version takes effect
-  on the next run. Already current: it says so and exits 0. If pip
-  is unavailable in the environment it prints the equivalent
-  manual `pipx` commands instead.
-- **`clip-harness version --check`** forces a fresh check on
-  demand, ignoring the daily throttle, and prints the verdict.
-
-`CLIP_HARNESS_UPDATE_BASE` overrides the feed base URL — mirror
-support, and how the test suites point the whole mechanism at a
-local `file://` directory feed.
-
-## Security model
-
-- The gate **fails closed**: hook crash/timeout/bad output on a gate
-  event means the payload does not run. Hard blocks are evaluated
-  before the allowlist.
-- File changes are **never written live before review**; they are
-  staged as candidates with base hashes, applied only on an explicit
-  recorded decision, verified after apply, and rolled back on partial
-  failure.
-- Decisions are **explicit data**, never inferred from silence. No
-  decision = pending, forever, until a human decides.
-- A held shell command executes only on a recorded decision, and a
-  sandboxed accept **fails closed** when the sandbox cannot be
-  built or `sandbox-exec` is unavailable — it never degrades into
-  a bare run. Unsandboxed execution requires its own explicit
-  decision, and `shell_sandbox: "strict"` removes even that.
-- The **receipt is written before the clipboard is overwritten**, so
-  the evidence trail never lags reality; every run's payload is
-  hashed into the ledger at capture time.
-- The passive watch loop **never auto-runs bare text** — bare-text
-  execution requires the explicit trigger (the human's hotkey), the
-  same trust model as a terminal.
-- Payloads are capped (32k chars); result blocks elide output past
-  `result_budget_chars` (default 100k) to a head + tail digest, with
-  the full output preserved byte-for-byte in the run's output file.
-- Hooks are *your* commands running with *your* privileges — the
-  settings file is a trust boundary, like Claude Code's.
-
-## Platform notes
-
-The lifecycle core is platform-independent and fully tested on Linux.
-The macOS adapters (`pbpaste`/`pbcopy`, VS Code diff opener) are thin
-and written against the same surfaces the original loop used; the
-iTerm2 watch backend (in-tab execution via the sentinel protocol,
-dedicated tab per the original script) is **written but untested on a
-Mac** — it needs iTerm2's Python runtime and the `iterm2` pip module.
-Headless adapters (file clipboard, decision.json file-drop) are the
-QA path for everything except the GUI surfaces.
-
-## Troubleshooting
-
-**Every command opens with `ERROR:root: code for hash blake2b was not
-found.` and a traceback.** Your Python was built without blake2
-support (no OpenSSL blake2 constructor, no builtin `_blake2` module —
-seen on corporate pyenv builds). CPython's `hashlib` logs that
-traceback itself at import time; clip-harness imports hashlib for
-sha256, so the spam lands on stderr before anything runs. Nothing is
-broken — sha256 is unaffected. clip-harness silences it by making
-its first hashlib import with logging briefly disabled (see
-`clip_harness/_quiet_hashlib.py`). The permanent fix is a Python
-built against a full OpenSSL.
-
-## Development
-
-```sh
-pip install -e '.[dev]'
-python3 -m pytest        # 387 tests: parser, gate, contract, lifecycle
-```
-
-Design rationale, in one line: correctness and contracts live in
-code, behaviour that must always happen lives in the core, and
-everything else is a hook.
+No Mac handy? The whole lifecycle runs headlessly:
+`python3 examples/sample_session/run_demo.py`.
+
+## Goal · Plan · Task
+
+Three separate things, on purpose:
+
+- **Goal** — the objective: a durable anchor with a stable id.
+  Sessions bind to it; it outlives them.
+- **Plan** — a Markdown document the model authors whole. The
+  harness stores it verbatim and never parses it.
+- **Task** — the only tracked execution state (`open` / `doing` /
+  `done`). What is current is read off the task states; there is
+  no stored "current step" that could disagree with them.
+
+## Find it fast
+
+Full documentation: **https://millhq.github.io/clip-harness/**
+(sources in [`docs/`](docs/)).
+
+| You want | Go to |
+|---|---|
+| The payload protocol — fences, result block, capability manifest | [site](https://millhq.github.io/clip-harness/protocol/) · [source](docs/protocol.md) |
+| Durable goals — concepts, the file store, export/import, migrations | [site](https://millhq.github.io/clip-harness/goals/) · [source](docs/goals.md) |
+| Hook lifecycle, the review gate, reviewed shell commands, settings | [site](https://millhq.github.io/clip-harness/hooks/) · [source](docs/hooks.md) |
+| CLI reference, updating | [site](https://millhq.github.io/clip-harness/cli/) · [source](docs/cli.md) |
+| Architecture, module map, security model, platform notes | [site](https://millhq.github.io/clip-harness/architecture/) · [source](docs/architecture.md) |
+| Troubleshooting | [site](https://millhq.github.io/clip-harness/troubleshooting/) · [source](docs/troubleshooting.md) |
+| Development | [site](https://millhq.github.io/clip-harness/development/) · [source](docs/development.md) |
 
 ## License
 

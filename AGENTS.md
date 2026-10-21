@@ -1,8 +1,9 @@
 # AGENTS.md — the clip-harness protocol, for the model on the other side of the clipboard
 
-> Derived from the protocol spec in README.md ("The payload protocol"),
-> which is the single source of truth. If the two ever disagree,
-> README.md wins. This file is written to be pasted (or pointed at)
+> Derived from the protocol spec in docs/protocol.md ("The payload
+> protocol"), which is the single source of truth. If the two ever
+> disagree, docs/protocol.md wins. This file is written to be pasted
+> (or pointed at)
 > once, at the start of a chat session, so every block you emit after
 > that is protocol-correct.
 
@@ -50,8 +51,8 @@ These are the tools you may invoke, and the block shape for each:
   (returned in the result block) and binds the session to it; the
   goal outlives the session.
   Shape: a ```shell fence with header `action: goal-set`.
-- **goal.list** — list every durable goal (uid, status, revision,
-  current plan step). Read-only; use it to rediscover a goal after
+- **goal.list** — list every durable goal (uid, human_id, status,
+  revision). Read-only; use it to rediscover a goal after
   losing the chat or session.
   Shape: a ```shell fence with header `action: goal-list`, no body,
   no session needed.

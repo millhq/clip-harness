@@ -1,0 +1,64 @@
+name: publish-pypi
+
+# Publishes the release's wheel + sdist to PyPI so the package can
+# be installed by name (`pipx install clip-harness`). Runs when a
+# GitHub Release is published; can also be dispatched by hand for an
+# existing tag (e.g. the first upload, or a retry). Authentication
+# is PyPI Trusted Publishing (OIDC) — there is no API token stored
+# anywhere; the matching pending publisher must be registered on
+# pypi.org for this repo + this workflow file before a run can
+# succeed. The GitHub Release remains the checksummed source for
+# `clip-harness upgrade` (SHA256SUMS); PyPI is the by-name channel.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.3.0). Defaults to the latest release."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # required for Trusted Publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name)
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "publishing tag: $TAG"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify tag matches package version
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          PKG=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "tag=$TAG package=$PKG"
+          test "${TAG#v}" = "$PKG"
+      - name: Build wheel + sdist
+        run: |
+          pip install build
+          python -m build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

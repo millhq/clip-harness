@@ -1,0 +1,5 @@
+# Docs-site build dependencies (CI only — not package dependencies).
+mkdocs
+mkdocs-material
+mkdocs-llmstxt
+mkdocs-rss-plugin

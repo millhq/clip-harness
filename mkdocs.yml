@@ -1,0 +1,55 @@
+exclude_docs: |
+  requirements.txt
+
+site_name: clip-harness
+site_description: "A human-in-the-loop execution bridge: run AI-chat-proposed commands from your clipboard, behind a Claude Code-style hook lifecycle with a fail-closed review gate."
+site_url: https://millhq.github.io/clip-harness/
+repo_url: https://github.com/millhq/clip-harness
+repo_name: millhq/clip-harness
+
+theme:
+  name: material
+  features:
+    - navigation.top
+    - content.code.copy
+
+markdown_extensions:
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+  - llmstxt:
+      markdown_description: "clip-harness documentation — the payload protocol, durable goals, the hook lifecycle and review gate, CLI reference, architecture and security model."
+      full_output: llms-full.txt
+      sections:
+        Documentation:
+          - index.md: Documentation home — the pitch and the find-it-fast map.
+          - protocol.md: The payload protocol — fences, execution modes, the result block, the capability manifest.
+          - goals.md: Durable goals — goal / plan / task, the file store, export & import, migrations.
+          - hooks.md: Hook lifecycle and the review gate — the hook contract, reviewed shell commands, settings.
+          - cli.md: CLI reference and updating.
+          - architecture.md: Architecture, module map, security model, platform notes.
+          - troubleshooting.md: Troubleshooting.
+          - development.md: Development.
+  - rss:
+      feed_title: clip-harness docs
+      feed_description: "Changes to the clip-harness documentation."
+      length: 20
+
+nav:
+  - Home: index.md
+  - Protocol: protocol.md
+  - Durable goals: goals.md
+  - Hooks & the review gate: hooks.md
+  - CLI & updating: cli.md
+  - Architecture & security: architecture.md
+  - Troubleshooting: troubleshooting.md
+  - Development: development.md
